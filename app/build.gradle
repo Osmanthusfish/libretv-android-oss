@@ -14,8 +14,8 @@ android {
         // 每次发版 versionCode 递增；build-apk.sh 会把版本写进 APK 文件名
         // 开源分支（opensource）：与私有版同一套代码，唯一差别是不打包任何内置源
         // versionName 带 -oss 后缀，安装时一眼能分清装的是哪个版本
-        versionCode 16
-        versionName '1.2.4-oss'
+        versionCode 29
+        versionName '1.2.17-oss'
     }
 
     buildTypes {
@@ -40,4 +40,8 @@ android {
             keepDebugSymbols += ['**/*.so']
         }
     }
+}
+
+dependencies {
+    implementation 'org.tukaani:xz:1.12'
 }

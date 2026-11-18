@@ -64,6 +64,45 @@
     return x.key ? 'k:' + String(x.key) : 'u:' + String(x.url || '');
   }
 
+  function updateOnlineSources(p) {
+    var entries = Array.isArray(p) ? p
+      : (p && p.state && p.state.customAPIs) || (p && (p.sources || p.sites));
+    if (!Array.isArray(entries)) return 'err:订阅需要包含点播源列表';
+    var store = JSON.parse(localStorage.getItem(KEY) || '{"state":{},"version":8}');
+    var state = store.state || {};
+    var prefix = 'ltv_online_';
+    var existing = Array.isArray(state.customAPIs) ? state.customAPIs : [];
+    var selected = new Set(Array.isArray(state.selectedKeys) ? state.selectedKeys : []);
+    var previous = new Set(existing.filter(fromOnline).map(function (item) { return item.key; }));
+    var next = new Map();
+    function fromOnline(item) {
+      return item && typeof item.key === 'string' && item.key.indexOf(prefix) === 0;
+    }
+    entries.some(function (entry) {
+      var item = normApi(entry);
+      if (!item) return false;
+      try {
+        var url = new URL(item.url);
+        if (!/^https?:$/.test(url.protocol) || url.username || url.password) return false;
+      } catch (e) { return false; }
+      item.key = prefix + hash(item.url);
+      next.set(item.key, item);
+      return next.size >= 100;
+    });
+    if (!next.size) return 'err:订阅没有可用的点播源';
+    previous.forEach(function (key) { if (!next.has(key)) selected.delete(key); });
+    next.forEach(function (item, key) {
+      if (item.isAdult && state.yellowFilter !== false) selected.delete(key);
+      else if (!previous.has(key)) selected.add(key);
+    });
+    state.customAPIs = existing.filter(function (item) { return !fromOnline(item); })
+      .concat(Array.from(next.values()));
+    state.selectedKeys = Array.from(selected);
+    store.state = state;
+    localStorage.setItem(KEY, JSON.stringify(store));
+    return 'ok:' + next.size;
+  }
+
   function mergeList(current, incoming) {
     var out = (MODE === 'replace') ? [] : (Array.isArray(current) ? current.slice() : []);
     var seen = {};
@@ -78,6 +117,7 @@
 
   try {
     var p = JSON.parse(RAW);
+    if (MODE === 'online') return updateOnlineSources(p);
     var apis = [], lives = [], subs = [], selected = [];
     if (p && p.state && Array.isArray(p.state.customAPIs)) {
       apis = p.state.customAPIs.map(normApi);

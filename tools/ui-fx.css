@@ -1,0 +1,920 @@
+/* ============================================================================
+ * LibreTV 1.2.16 — Aurora Liquid Glass Design System & Motion Architecture
+ * ============================================================================ */
+
+:root {
+  --c-page: 242 246 252;
+  --c-surface: 255 255 255;
+  --c-surface-raised: 255 255 255;
+  --c-card: 255 255 255;
+  --c-chip: 235 241 250;
+  --c-hover: 226 234 246;
+  --c-line: 214 224 238;
+  --c-content: 15 23 42;
+  --c-muted: 71 85 105;
+  --c-faint: 100 116 139;
+  --c-accent: 2 132 199;
+  --c-accent-hover: 3 105 161;
+  --c-on-accent: 255 255 255;
+  --ltv-accent-2: 79 70 229;
+  --ltv-accent-3: 236 72 153;
+  --ltv-glass-bg: rgba(255, 255, 255, 0.78);
+  --ltv-glass-strong: rgba(255, 255, 255, 0.90);
+  --ltv-border-soft: rgba(15, 23, 42, 0.08);
+  --ltv-border-glow: rgba(2, 132, 199, 0.28);
+  --ltv-shadow-card: 0 8px 24px -10px rgba(15, 23, 42, 0.14), 0 1px 0 rgba(255, 255, 255, 0.8) inset;
+  --ltv-shadow-hover: 0 20px 36px -14px rgba(2, 132, 199, 0.28), 0 8px 20px -10px rgba(15, 23, 42, 0.16);
+  --ltv-shadow-modal: 0 28px 64px -12px rgba(15, 23, 42, 0.34), 0 0 0 1px rgba(255, 255, 255, 0.6) inset;
+  --ltv-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ltv-bounce: cubic-bezier(0.34, 1.45, 0.64, 1);
+}
+
+.dark {
+  --c-page: 8 13 24;
+  --c-surface: 15 23 38;
+  --c-surface-raised: 18 28 46;
+  --c-card: 14 22 36;
+  --c-chip: 24 36 56;
+  --c-hover: 33 49 74;
+  --c-line: 44 65 96;
+  --c-content: 238 245 255;
+  --c-muted: 148 168 196;
+  --c-faint: 118 138 168;
+  --c-accent: 0 200 248;
+  --c-accent-hover: 64 220 255;
+  --c-on-accent: 6 16 28;
+  --ltv-accent-2: 99 102 241;
+  --ltv-accent-3: 244 114 182;
+  --ltv-glass-bg: rgba(14, 22, 36, 0.72);
+  --ltv-glass-strong: rgba(17, 27, 45, 0.88);
+  --ltv-border-soft: rgba(180, 212, 255, 0.12);
+  --ltv-border-glow: rgba(0, 200, 248, 0.36);
+  --ltv-shadow-card: 0 10px 26px -12px rgba(0, 0, 0, 0.65), 0 1px 0 rgba(255, 255, 255, 0.06) inset;
+  --ltv-shadow-hover: 0 22px 42px -12px rgba(0, 184, 230, 0.28), 0 12px 24px -8px rgba(0, 0, 0, 0.7);
+  --ltv-shadow-modal: 0 32px 72px -12px rgba(0, 0, 0, 0.78), 0 1px 0 rgba(255, 255, 255, 0.1) inset;
+}
+
+/* WCAG 2.4.11 Focus Not Obscured under sticky header */
+html {
+  scroll-padding-top: 4.5rem;
+  scroll-behavior: smooth;
+  background: linear-gradient(180deg, #f3f7fe 0%, #eaf0fa 100%) fixed;
+}
+
+html.dark {
+  background: linear-gradient(180deg, #070b14 0%, #0b1322 52%, #0f1a2e 100%) fixed;
+}
+
+body,
+.dark body {
+  background: transparent !important;
+  position: relative;
+  z-index: 0;
+  min-height: 100dvh;
+}
+
+/* Ambient aurora mesh backdrop (compositor-only drift; never creates transform on body itself) */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -18% -14%;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    radial-gradient(56% 42% at 18% 12%, rgba(0, 200, 248, 0.16), transparent 72%),
+    radial-gradient(48% 40% at 84% 18%, rgba(99, 102, 241, 0.14), transparent 72%),
+    radial-gradient(50% 44% at 52% 88%, rgba(244, 114, 182, 0.09), transparent 74%);
+  will-change: transform;
+}
+
+.dark body::before {
+  background-image:
+    radial-gradient(58% 44% at 16% 10%, rgba(0, 200, 248, 0.20), transparent 70%),
+    radial-gradient(50% 42% at 86% 16%, rgba(99, 102, 241, 0.18), transparent 72%),
+    radial-gradient(52% 46% at 50% 90%, rgba(244, 114, 182, 0.11), transparent 74%);
+}
+
+@keyframes ltv-aurora-drift {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(-2.5%, 2%, 0) scale(1.06); }
+  100% { transform: translate3d(2%, -1.5%, 0) scale(1.02); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  body::before {
+    animation: ltv-aurora-drift 22s ease-in-out infinite alternate;
+  }
+
+  /* Yield GPU compositor budget to video frame decode & gestures during playback */
+  html.ltv-fs body::before,
+  html.ltv-fs-manual body::before,
+  body:has(video)::before {
+    animation-play-state: paused !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Sticky Glass Header & Scroll-Driven Elevation
+ * -------------------------------------------------------------------------- */
+header.sticky.top-0 {
+  background: var(--ltv-glass-bg) !important;
+  backdrop-filter: blur(20px) saturate(165%);
+  -webkit-backdrop-filter: blur(20px) saturate(165%);
+  border-bottom: 1px solid var(--ltv-border-soft) !important;
+  transition:
+    background-color 0.25s var(--ltv-spring),
+    box-shadow 0.25s var(--ltv-spring),
+    border-color 0.25s var(--ltv-spring);
+}
+
+header.sticky.top-0::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent 5%, rgba(var(--c-accent) / 0.45) 35%, rgba(var(--ltv-accent-2) / 0.42) 65%, transparent 95%);
+  opacity: 0.45;
+  transition: opacity 0.25s ease;
+}
+
+header.sticky.top-0[data-scrolled="1"] {
+  background: var(--ltv-glass-strong) !important;
+  box-shadow: 0 12px 32px -12px rgba(0, 0, 0, 0.38);
+}
+
+header.sticky.top-0[data-scrolled="1"]::after {
+  opacity: 0.9;
+}
+
+header.sticky.top-0 > div {
+  min-height: 3.5rem;
+  height: auto !important;
+  padding-top: 0.3rem;
+  padding-bottom: 0.3rem;
+}
+
+header.sticky.top-0 .min-w-0 > p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes ltv-header-scroll-elevate {
+  from {
+    box-shadow: 0 0 0 rgba(0, 0, 0, 0);
+  }
+  to {
+    background-color: var(--ltv-glass-strong);
+    box-shadow: 0 14px 36px -14px rgba(0, 0, 0, 0.48);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @supports ((animation-timeline: scroll()) and (animation-range: 0% 100%)) {
+    header.sticky.top-0 {
+      animation: ltv-header-scroll-elevate auto linear both;
+      animation-timeline: scroll(block root);
+      animation-range: 0px 96px;
+    }
+  }
+}
+
+header.sticky a[href="/"] img,
+header.sticky img[src*="/icons/"] {
+  border-radius: 0.55rem;
+  box-shadow: 0 4px 12px -2px rgba(var(--c-accent) / 0.35), 0 0 0 1px rgba(255, 255, 255, 0.16);
+  transition: transform 0.28s var(--ltv-bounce), box-shadow 0.28s ease;
+}
+
+header.sticky a[href="/"]:active img,
+header.sticky a[href="/"]:hover img {
+  transform: scale(1.07);
+  box-shadow: 0 8px 18px -2px rgba(var(--c-accent) / 0.52), 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+
+/* --------------------------------------------------------------------------
+ * Brand Gradient Hero & Search Spotlight Capsule
+ * -------------------------------------------------------------------------- */
+@keyframes ltv-gradient-flow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.brand-gradient {
+  background-image: linear-gradient(115deg, #38bdf8 0%, #22d3ee 24%, #818cf8 52%, #f472b6 78%, #38bdf8 100%) !important;
+  background-size: 220% auto !important;
+  -webkit-background-clip: text !important;
+  background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  color: transparent !important;
+  letter-spacing: -0.02em;
+  filter: drop-shadow(0 6px 22px rgba(0, 200, 248, 0.22));
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .brand-gradient {
+    animation: ltv-gradient-flow 9s ease-in-out infinite;
+  }
+}
+
+/* Search inputs & spotlight focus aura */
+form > div:has(> input),
+.input {
+  border-color: var(--ltv-border-soft);
+  transition:
+    transform 0.22s var(--ltv-spring),
+    border-color 0.22s ease,
+    box-shadow 0.22s ease,
+    background-color 0.22s ease !important;
+}
+
+form > div:has(> input) {
+  background: var(--ltv-glass-bg);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  box-shadow: var(--ltv-shadow-card);
+}
+
+form > div:has(> input):focus-within {
+  border-color: rgb(var(--c-accent)) !important;
+  box-shadow:
+    0 0 0 3px rgba(var(--c-accent) / 0.18),
+    0 14px 30px -10px rgba(var(--c-accent) / 0.28) !important;
+  transform: translateY(-1px);
+}
+
+.input:focus,
+.input:focus-visible {
+  border-color: rgb(var(--c-accent)) !important;
+  box-shadow: 0 0 0 3px rgba(var(--c-accent) / 0.16) !important;
+  outline: none;
+}
+
+/* Dropdown search history & listbox discrete entry */
+#header-search-history,
+[role="listbox"] {
+  background: var(--ltv-glass-strong) !important;
+  backdrop-filter: blur(22px) saturate(175%);
+  -webkit-backdrop-filter: blur(22px) saturate(175%);
+  border-color: var(--ltv-border-soft) !important;
+  box-shadow: var(--ltv-shadow-modal);
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  transition:
+    opacity 0.2s var(--ltv-spring),
+    transform 0.2s var(--ltv-spring);
+  transition-behavior: allow-discrete;
+}
+
+@starting-style {
+  #header-search-history,
+  [role="listbox"] {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * 3D Perspective Tilt + Specular Shine Poster Cards & Scroll Reveals
+ * -------------------------------------------------------------------------- */
+.card {
+  position: relative;
+  border-radius: 0.78rem !important;
+  border-color: var(--ltv-border-soft) !important;
+  background: var(--ltv-glass-bg) !important;
+  box-shadow: var(--ltv-shadow-card);
+  transition:
+    transform 0.26s var(--ltv-spring),
+    box-shadow 0.26s var(--ltv-spring),
+    border-color 0.26s ease,
+    opacity 0.28s ease !important;
+}
+
+.card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(
+    220px circle at var(--ltv-gx, 50%) var(--ltv-gy, 25%),
+    rgba(255, 255, 255, 0.22),
+    rgba(var(--c-accent) / 0.10) 42%,
+    transparent 74%
+  );
+  transition: opacity 0.24s ease;
+  z-index: 2;
+}
+
+.card:active {
+  transform: scale(0.962) !important;
+  border-color: var(--ltv-border-glow) !important;
+  box-shadow: 0 6px 18px -6px rgba(var(--c-accent) / 0.42) !important;
+}
+
+.card:active::after {
+  opacity: 0.9;
+}
+
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  .card.cursor-pointer:hover {
+    transform:
+      perspective(760px)
+      rotateX(var(--ltv-rx, 0deg))
+      rotateY(var(--ltv-ry, 0deg))
+      translateY(-4px)
+      scale(1.028) !important;
+    border-color: var(--ltv-border-glow) !important;
+    box-shadow: var(--ltv-shadow-hover) !important;
+  }
+
+  .card.cursor-pointer:hover::after {
+    opacity: 1;
+  }
+}
+
+.card img {
+  transition: transform 0.45s var(--ltv-spring), opacity 0.35s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .card.cursor-pointer:hover img {
+    transform: scale(1.06);
+  }
+}
+
+.card .tag,
+.card [class*="rounded-full"],
+.card [class*="bg-black/"] {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* View-Timeline scroll-driven reveals on poster grid cards */
+@keyframes ltv-card-reveal {
+  from {
+    opacity: 0.28;
+    translate: 0 20px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @supports ((animation-timeline: view()) and (animation-range: entry)) {
+    main .grid > .card {
+      animation: ltv-card-reveal auto cubic-bezier(0.22, 1, 0.36, 1) both;
+      animation-timeline: view(block);
+      animation-range: entry 0% cover 24%;
+    }
+  }
+}
+
+/* Fallback reveal class driven by IntersectionObserver when view() unsupported */
+.card.ltv-io-pending {
+  opacity: 0.28;
+  translate: 0 16px;
+}
+
+.card.ltv-io-visible {
+  opacity: 1;
+  translate: 0 0;
+}
+
+/* Shimmer skeletons replacing static pulse */
+@keyframes ltv-shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-pulse {
+  position: relative;
+  overflow: hidden;
+  background-color: rgba(var(--c-chip) / 0.85) !important;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-pulse {
+    animation: none !important;
+  }
+
+  .animate-pulse::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      105deg,
+      transparent 20%,
+      rgba(255, 255, 255, 0.14) 50%,
+      transparent 80%
+    );
+    animation: ltv-shimmer 1.45s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+
+  :root:not(.dark) .animate-pulse::after {
+    background: linear-gradient(
+      105deg,
+      transparent 20%,
+      rgba(255, 255, 255, 0.62) 50%,
+      transparent 80%
+    );
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Aurora Buttons, Pills, Chips & Ripple Effect
+ * -------------------------------------------------------------------------- */
+.btn,
+.btn-primary,
+.btn-ghost,
+.chip,
+button[role="tab"],
+section[aria-label] button:not(.card *) {
+  position: relative;
+  overflow: hidden;
+  transition:
+    transform 0.16s var(--ltv-spring),
+    background-color 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.2s ease,
+    color 0.18s ease;
+}
+
+.btn:active:not(:disabled),
+.btn-primary:active:not(:disabled),
+.btn-ghost:active:not(:disabled),
+.chip:active:not(:disabled),
+button[role="tab"]:active {
+  transform: scale(0.955);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, rgb(var(--c-accent)) 0%, rgb(var(--ltv-accent-2)) 100%) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  box-shadow:
+    0 8px 20px -6px rgba(var(--c-accent) / 0.46),
+    0 1px 0 rgba(255, 255, 255, 0.28) inset !important;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow:
+    0 12px 26px -6px rgba(var(--c-accent) / 0.56),
+    0 1px 0 rgba(255, 255, 255, 0.34) inset !important;
+}
+
+.btn-ghost {
+  border: 1px solid var(--ltv-border-soft);
+  background: rgba(var(--c-chip) / 0.55);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  border-color: var(--ltv-border-glow);
+  background: rgba(var(--c-hover) / 0.9);
+}
+
+@keyframes ltv-ripple-expand {
+  from {
+    transform: translate(-50%, -50%) scale(0);
+    opacity: 0.42;
+  }
+  to {
+    transform: translate(-50%, -50%) scale(2.6);
+    opacity: 0;
+  }
+}
+
+.ltv-ripple {
+  position: absolute;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.55) 0%, rgba(var(--c-accent) / 0.25) 60%, transparent 100%);
+  animation: ltv-ripple-expand 480ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* --------------------------------------------------------------------------
+ * Modals, Drawers & Toasts (Glassmorphism + @starting-style)
+ * -------------------------------------------------------------------------- */
+.fixed.inset-0.z-\[60\],
+.fixed.inset-0.z-\[65\],
+.fixed.inset-0.z-\[80\],
+.fixed.inset-0.z-\[95\] {
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  background-color: rgba(6, 10, 18, 0.72) !important;
+}
+
+/* Backdrop inside z-50 Drawer and z-[80] AlertDialog */
+.fixed.inset-0.z-50 > .bg-black\/60,
+.fixed.inset-0.z-\[80\] > .bg-black\/70 {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* Modal & Dialog glass surface (do NOT override transform on z-50 drawer so swipe/translate slide stays intact) */
+[role="dialog"],
+[role="alertdialog"] {
+  background: var(--ltv-glass-strong) !important;
+  backdrop-filter: blur(26px) saturate(175%);
+  -webkit-backdrop-filter: blur(26px) saturate(175%);
+  border: 1px solid var(--ltv-border-soft) !important;
+  box-shadow: var(--ltv-shadow-modal) !important;
+}
+
+.fixed.inset-0.z-50 > [role="dialog"] {
+  transition-timing-function: var(--ltv-spring) !important;
+  transition-duration: 280ms !important;
+}
+
+.fixed.inset-0:not(.z-50) > [role="dialog"],
+.fixed.inset-0 > [role="alertdialog"] {
+  opacity: 1;
+  scale: 1;
+  translate: 0 0;
+  transition:
+    opacity 0.24s var(--ltv-spring),
+    scale 0.28s var(--ltv-bounce),
+    translate 0.26s var(--ltv-spring);
+  transition-behavior: allow-discrete;
+}
+
+@starting-style {
+  .fixed.inset-0:not(.z-50) > [role="dialog"],
+  .fixed.inset-0 > [role="alertdialog"] {
+    opacity: 0;
+    scale: 0.94;
+    translate: 0 18px;
+  }
+}
+
+.fixed.inset-0.z-50 [role="tablist"] {
+  background: rgba(var(--c-chip) / 0.72);
+  border: 1px solid var(--ltv-border-soft);
+}
+
+.fixed.inset-0.z-50 button[role="tab"][aria-selected="true"] {
+  background: linear-gradient(135deg, rgba(var(--c-accent) / 0.22), rgba(var(--ltv-accent-2) / 0.22));
+  box-shadow: 0 2px 10px -2px rgba(var(--c-accent) / 0.35), 0 0 0 1px rgba(var(--c-accent) / 0.35) inset;
+  color: rgb(var(--c-content));
+}
+
+/* Toasts floating stack */
+.fixed.top-4.z-\[100\] > div {
+  backdrop-filter: blur(18px) saturate(170%);
+  -webkit-backdrop-filter: blur(18px) saturate(170%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.45);
+  opacity: 1;
+  translate: 0 0;
+  scale: 1;
+  transition:
+    opacity 0.24s var(--ltv-spring),
+    translate 0.26s var(--ltv-bounce),
+    scale 0.26s var(--ltv-bounce);
+  transition-behavior: allow-discrete;
+}
+
+@starting-style {
+  .fixed.top-4.z-\[100\] > div {
+    opacity: 0;
+    translate: 0 -14px;
+    scale: 0.94;
+  }
+}
+
+/* Discrete exit state fallback hook (used by ui-fx.js helper on non-VDOM overlays) */
+[data-closing] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* --------------------------------------------------------------------------
+ * Watch Page (/watch) Sticky Stage, Poster Cross-Fade, Controls & Episode Tiles
+ * -------------------------------------------------------------------------- */
+.ltv-player-poster {
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 380ms cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 0s;
+  will-change: opacity;
+}
+
+.ltv-player-poster[data-ltv-poster="0"] {
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 380ms cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 380ms;
+}
+
+.ltv-autoplay-badge {
+  background: rgba(10, 16, 28, 0.68);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(180, 212, 255, 0.16);
+  color: rgba(226, 236, 252, 0.88);
+  transition:
+    opacity 360ms ease,
+    transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.ltv-autoplay-badge[data-ltv-autoplay-badge="0"],
+html.ltv-fs .ltv-autoplay-badge,
+html.ltv-fs-manual .ltv-autoplay-badge {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.aspect-video .animate-fade-in,
+.artplayer ~ div.top-4 {
+  background: rgba(12, 19, 32, 0.82) !important;
+  backdrop-filter: blur(16px) saturate(165%);
+  -webkit-backdrop-filter: blur(16px) saturate(165%);
+  border: 1px solid rgba(180, 212, 255, 0.22);
+  box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.6);
+  transition:
+    opacity 220ms var(--ltv-spring),
+    translate 240ms var(--ltv-spring);
+}
+
+@starting-style {
+  .aspect-video .animate-fade-in,
+  .artplayer ~ div.top-4 {
+    opacity: 0;
+    translate: 0 -8px;
+  }
+}
+
+html.ltv-fs .aspect-video .animate-fade-in,
+html.ltv-fs .artplayer ~ div.top-4 {
+  top: calc(64px + env(safe-area-inset-top, 0px)) !important;
+}
+
+@media (max-width: 1023px) and (orientation: portrait) {
+  html:not(.ltv-fs):not(.ltv-fs-manual) main.max-w-7xl > .grid > div:first-child > .aspect-video:not(:has(.art-fullscreen-web)) {
+    position: sticky;
+    top: 3.5rem;
+    z-index: 25;
+    box-shadow: 0 14px 32px -12px rgba(0, 0, 0, 0.72);
+  }
+}
+
+main.max-w-7xl .aspect-video + div.flex.flex-wrap {
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.85rem;
+  background: var(--ltv-glass-bg);
+  border: 1px solid var(--ltv-border-soft);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: var(--ltv-shadow-card);
+}
+
+main.max-w-7xl .aspect-video + div input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  width: 2.15rem !important;
+  height: 1.25rem !important;
+  border-radius: 9999px;
+  background: rgba(var(--c-line) / 0.72);
+  border: 1px solid var(--ltv-border-soft);
+  cursor: pointer;
+  transition:
+    background-color 200ms var(--ltv-spring),
+    border-color 200ms ease;
+}
+
+main.max-w-7xl .aspect-video + div input[type="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.25rem - 6px);
+  height: calc(1.25rem - 6px);
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+main.max-w-7xl .aspect-video + div input[type="checkbox"]:checked {
+  background: linear-gradient(135deg, rgb(var(--c-accent)) 0%, rgb(var(--ltv-accent-2)) 100%);
+  border-color: rgba(125, 211, 252, 0.55);
+}
+
+main.max-w-7xl .aspect-video + div input[type="checkbox"]:checked::before {
+  transform: translateX(0.9rem);
+}
+
+main.max-w-7xl .aspect-video + div input[type="checkbox"]:focus-visible {
+  outline: 2px solid rgb(var(--c-accent));
+  outline-offset: 2px;
+}
+
+aside.bg-surface-raised {
+  contain: layout style paint;
+}
+
+aside .grid > button.btn {
+  min-height: 2.45rem;
+  border-radius: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  transition:
+    transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease;
+  transition-timing-function: linear(0, 0.45 20%, 1.05 55%, 1), ease, ease, ease;
+}
+
+[role="tablist"][aria-label="选择播放源"] {
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
+}
+
+[role="tablist"][aria-label="选择播放源"] > button {
+  scroll-snap-align: start;
+}
+
+.episode-active {
+  background: linear-gradient(135deg, rgb(var(--c-accent)) 0%, rgb(var(--ltv-accent-2)) 100%) !important;
+  border-color: rgba(125, 211, 252, 0.65) !important;
+  color: #ffffff !important;
+  font-weight: 600;
+  box-shadow:
+    0 0 0 1px rgba(125, 211, 252, 0.38),
+    0 6px 18px -4px rgba(var(--c-accent) / 0.52);
+}
+
+.episode-active::before {
+  content: "";
+  width: 0.36rem;
+  height: 0.36rem;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.85);
+}
+
+@media (min-width: 641px) and (orientation: landscape) {
+  main.max-w-7xl .aspect-video:has(.artplayer),
+  main.max-w-7xl .aspect-video:has(video) {
+    box-shadow:
+      0 24px 60px -18px rgba(0, 0, 0, 0.75),
+      0 0 42px -12px rgba(var(--c-accent) / 0.25);
+    border: 1px solid var(--ltv-border-soft);
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Live TV Page (/live) Radar Dot, Channel Cards & Floating Pill
+ * -------------------------------------------------------------------------- */
+@keyframes ltv-radar-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  75% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+.live-dot {
+  position: relative;
+  background: #ff4757 !important;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .live-dot::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background: rgba(255, 71, 87, 0.72);
+    pointer-events: none;
+    animation: ltv-radar-pulse 1.9s cubic-bezier(0.22, 1, 0.36, 1) infinite !important;
+  }
+}
+
+.fixed.bottom-4.right-4.z-30.rounded-full {
+  background: linear-gradient(135deg, rgb(var(--c-accent)) 0%, rgb(var(--ltv-accent-2)) 100%) !important;
+  color: #ffffff !important;
+  box-shadow: 0 12px 28px -6px rgba(var(--c-accent) / 0.52), 0 0 0 1px rgba(255, 255, 255, 0.25) inset !important;
+}
+
+/* --------------------------------------------------------------------------
+ * Content-Visibility Isolation on Large Virtual-Free Lists (Excluding #ltv-playback-options)
+ * -------------------------------------------------------------------------- */
+[data-channel-list] > button,
+[data-channel-list] > div,
+.fixed.inset-0.z-50 [role="dialog"] .space-y-2 > .card,
+.fixed.inset-0.z-50 [role="dialog"] .space-y-2 > div:has(> .card) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 260px auto 72px;
+}
+
+@supports not (content-visibility: auto) {
+  [data-channel-list] > button,
+  [data-channel-list] > div,
+  .fixed.inset-0.z-50 [role="dialog"] .space-y-2 > .card {
+    contain: layout style paint;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Same-Document View Transitions (Theme Reveal + Shared Poster Hero)
+ * -------------------------------------------------------------------------- */
+::view-transition-group(ltv-poster-hero) {
+  animation-duration: 360ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+::view-transition-old(ltv-poster-hero),
+::view-transition-new(ltv-poster-hero) {
+  height: 100%;
+  object-fit: cover;
+  border-radius: 0.78rem;
+  box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.65);
+}
+
+@keyframes ltv-vt-circle-in {
+  from {
+    clip-path: circle(0px at var(--ltv-vt-x, 90%) var(--ltv-vt-y, 32px));
+  }
+  to {
+    clip-path: circle(var(--ltv-vt-r, 150vmax) at var(--ltv-vt-x, 90%) var(--ltv-vt-y, 32px));
+  }
+}
+
+html[data-ltv-vt="theme"]::view-transition-old(root) {
+  animation: none;
+  z-index: 1;
+}
+
+html[data-ltv-vt="theme"]::view-transition-new(root) {
+  animation: ltv-vt-circle-in 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  z-index: 2;
+  mix-blend-mode: normal;
+}
+
+/* --------------------------------------------------------------------------
+ * Reduced Motion Safeguards (Per Case Basis; Preserving Color Transitions)
+ * -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .card,
+  .btn,
+  .btn-primary,
+  .btn-ghost,
+  .chip,
+  form > div:has(> input),
+  header.sticky a[href="/"] img,
+  .fixed.inset-0:not(.z-50) > [role="dialog"],
+  .fixed.inset-0 > [role="alertdialog"],
+  .fixed.top-4.z-\[100\] > div,
+  .aspect-video .animate-fade-in,
+  .artplayer ~ div.top-4,
+  .ltv-autoplay-badge,
+  main.max-w-7xl .aspect-video + div input[type="checkbox"]::before,
+  aside .grid > button.btn,
+  #header-search-history,
+  [role="listbox"] {
+    transition-duration: 0.12s !important;
+    transform: none !important;
+    scale: 1 !important;
+    translate: none !important;
+  }
+
+  @starting-style {
+    .fixed.inset-0:not(.z-50) > [role="dialog"],
+    .fixed.inset-0 > [role="alertdialog"],
+    .fixed.top-4.z-\[100\] > div,
+    #header-search-history,
+    [role="listbox"] {
+      scale: 1;
+      translate: none;
+    }
+  }
+
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}
+/* ltv-ui-fx-v1 */

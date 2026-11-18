@@ -5,7 +5,6 @@ import android.net.ConnectivityManager;
 import android.net.LinkProperties;
 import android.os.Build;
 
-import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -21,7 +20,6 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
 import java.util.Map;
-import java.util.zip.GZIPInputStream;
 
 /**
  * 在手机本机启动 LibreTV 的 Next.js standalone 服务。
@@ -32,7 +30,7 @@ import java.util.zip.GZIPInputStream;
  *  - LD_LIBRARY_PATH 指向 nativeLibraryDir，覆盖 ELF 里写死的 Termux RUNPATH。
  *  - 官方 standalone 包（tar.gz）首次启动解压到 files/libretv-runtime，
  *    用版本标记文件避免重复解压；解压只处理普通文件，忽略目录/链接。
- *  - 服务是 Activity 子进程，随界面生命周期；退到后台过久可能被系统回收。
+ *  - Node 由 LocalServerService 管理，独立于 Activity 生命周期。
  */
 public class LocalServer {
 
@@ -48,7 +46,7 @@ public class LocalServer {
 
     private final Context ctx;
     private final Callback cb;
-    private Process process;
+    private volatile Process process;
     private Thread logThread;
     private volatile boolean stopped = false;
     /** 启动令牌。每次 start()/stop() 自增，旧线程在每个检查点比对后自行退出。
@@ -56,9 +54,9 @@ public class LocalServer {
      *  正在跑的解压线程于是继续往下走，结果两个线程同时解压 42MB 并各起一个 Node 抢 8899。 */
     private volatile int generation = 0;
     /** 启动串行化：同一时刻只允许一个线程做解压 / 启动，避免 IO 打满导致界面卡死。 */
-    private final Object startLock = new Object();
+    private static final Object startLock = new Object();
     private int port = 8899;
-    private String logTail = "";
+    private volatile String logTail = "";
 
     public LocalServer(Context ctx, Callback cb) {
         this.ctx = ctx.getApplicationContext();
@@ -123,42 +121,53 @@ public class LocalServer {
     /**
      * 取系统当前 DNS 服务器，给 Node 的 c-ares 兜底用。
      * Android 的 getaddrinfo 走 netd，但纯 native 子进程解析失败时没有 resolv.conf
-     * 可依赖；把系统 DNS 明确告诉 c-ares，才能做 dns.lookup 的第二条路。
+     * 可依赖；把稳定公共 DNS 与系统 DNS 组合告诉 c-ares，才能防止切网（Wi-Fi <-> 5G/热点）
+     * 后老旧局域网网关 DNS（192.168.x.x 等）拖死每次解析。
      */
     private String androidDnsServers() {
         try {
             ConnectivityManager cm =
                     (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
-            if (cm == null) return "";
-            java.util.LinkedHashSet<String> found = new java.util.LinkedHashSet<String>();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                android.net.Network n = cm.getActiveNetwork();
-                addDns(cm, n, found);
-            } else {
-                for (android.net.Network n : cm.getAllNetworks()) addDns(cm, n, found);
+            java.util.LinkedHashSet<String> pubSys = new java.util.LinkedHashSet<String>();
+            java.util.LinkedHashSet<String> privSys = new java.util.LinkedHashSet<String>();
+            if (cm != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    addDnsSplit(cm, cm.getActiveNetwork(), pubSys, privSys);
+                } else {
+                    for (android.net.Network n : cm.getAllNetworks()) addDnsSplit(cm, n, pubSys, privSys);
+                }
             }
-            // 运营商 DNS 不可靠时补两个公共 DNS，保证 c-ares 至少有可用上游
-            found.add("223.5.5.5");
-            found.add("8.8.8.8");
+            java.util.LinkedHashSet<String> ordered = new java.util.LinkedHashSet<String>(pubSys);
+            // 国内三网 / 热点通用高可用公共 Do53，排在私网网关前避免切网后卡死
+            ordered.add("223.5.5.5");
+            ordered.add("119.29.29.29");
+            ordered.addAll(privSys);
+            ordered.add("8.8.8.8");
             StringBuilder b = new StringBuilder();
-            for (String s : found) {
+            for (String s : ordered) {
                 if (b.length() > 0) b.append(',');
                 b.append(s);
             }
             return b.toString();
         } catch (Exception e) {
-            return "223.5.5.5,8.8.8.8";
+            return "223.5.5.5,119.29.29.29,8.8.8.8";
         }
     }
 
-    private void addDns(ConnectivityManager cm, android.net.Network n,
-                        java.util.Set<String> out) {
+    private void addDnsSplit(ConnectivityManager cm, android.net.Network n,
+                             java.util.Set<String> pubOut, java.util.Set<String> privOut) {
         if (n == null) return;
         try {
             LinkProperties lp = cm.getLinkProperties(n);
             if (lp == null) return;
             for (InetAddress a : lp.getDnsServers()) {
-                if (a != null && a.getAddress().length == 4) out.add(a.getHostAddress());
+                if (a != null && a.getAddress().length == 4) {
+                    if (a.isSiteLocalAddress() || a.isLoopbackAddress() || a.isLinkLocalAddress()) {
+                        privOut.add(a.getHostAddress());
+                    } else {
+                        pubOut.add(a.getHostAddress());
+                    }
+                }
             }
         } catch (Exception ignored) { }
     }
@@ -256,9 +265,10 @@ public class LocalServer {
     }
 
     public boolean isRunning() {
-        if (process == null) return false;
+        Process current = process;
+        if (current == null) return false;
         try {
-            process.exitValue();
+            current.exitValue();
             return false;
         } catch (IllegalThreadStateException e) {
             return true;
@@ -374,9 +384,11 @@ public class LocalServer {
         dir.mkdirs();
 
         cb.onProgress("首次启动：正在解压 LibreTV 运行包（约 42 MB）…", 5);
-        InputStream raw = ctx.getAssets().open(RUNTIME_ASSET);
-        unpackTarGz(raw, dir, gen);
-        raw.close();
+        try (InputStream raw = ctx.getAssets().open(RUNTIME_ASSET);
+             InputStream tar = RuntimeCompression.open(raw)) {
+            unpackTar(tar, dir, gen);
+        }
+        if (gen != generation) return;
         if (!server.isFile()) throw new IOException("运行包解压后缺少 server.js");
         writeText(mark, tag);
         // 密码只通过进程环境变量注入，不写进磁盘（避免明文落盘，也避免 .env.local 覆盖）
@@ -589,16 +601,15 @@ public class LocalServer {
         return null;
     }
 
-    // ------------------------------------------------------------ tar.gz (USTAR)
+    // ------------------------------------------------------------ tar (USTAR)
 
-    private void unpackTarGz(InputStream raw, File dest, int gen) throws IOException {
-        GZIPInputStream gz = new GZIPInputStream(new BufferedInputStream(raw, 32768));
+    private void unpackTar(InputStream tar, File dest, int gen) throws IOException {
         byte[] hdr = new byte[512];
         String longName = null;
         int files = 0;
-        while (readFully(gz, hdr)) {
+        while (readFully(tar, hdr)) {
             // 启动已被更新的请求取代：立刻停手，别和另一个线程抢着解压同一个目录
-            if (gen != generation) { try { gz.close(); } catch (Exception ignored) { } throw new IOException("启动已被取消"); }
+            if (gen != generation) throw new IOException("启动已被取消");
             if (allZero(hdr)) break;
             String name = str(hdr, 0, 100);
             String prefix = str(hdr, 345, 155);
@@ -609,9 +620,9 @@ public class LocalServer {
 
             if (type == 'L') {                       // GNU long name
                 byte[] b = new byte[(int) size];
-                readFully(gz, b);
+                if (!readFully(tar, b)) throw new IOException("运行包长文件名不完整");
                 longName = str(b, 0, b.length);
-                skipFully(gz, padded - size);
+                skipFully(tar, padded - size);
                 continue;
             }
             if (longName != null) {
@@ -621,28 +632,28 @@ public class LocalServer {
             if (name.startsWith("./")) name = name.substring(2);
             if (name.isEmpty() || name.endsWith("/") || type == '5'
                     || (type != 0 && type != '0')) {
-                skipFully(gz, padded);
+                skipFully(tar, padded);
                 continue;
             }
             File out = new File(dest, name);
             String safe = dest.getCanonicalPath();
             if (!out.getCanonicalPath().startsWith(safe + File.separator)) {
-                skipFully(gz, padded);
+                skipFully(tar, padded);
                 continue;
             }
             File parent = out.getParentFile();
             if (parent != null) parent.mkdirs();
-            OutputStream os = new FileOutputStream(out);
             long left = size;
             byte[] buf = new byte[32768];
-            while (left > 0) {
-                int r = gz.read(buf, 0, (int) Math.min(buf.length, left));
-                if (r < 0) break;
-                os.write(buf, 0, r);
-                left -= r;
+            try (OutputStream os = new FileOutputStream(out)) {
+                while (left > 0) {
+                    int r = tar.read(buf, 0, (int) Math.min(buf.length, left));
+                    if (r < 0) throw new IOException("运行包文件不完整：" + name);
+                    os.write(buf, 0, r);
+                    left -= r;
+                }
             }
-            os.close();
-            skipFully(gz, padded - size);
+            skipFully(tar, padded - size);
             files++;
             if (files % 250 == 0) {
                 cb.onProgress("解压运行包… " + files + " 个文件", 5 + Math.min(18, files / 120));

@@ -37,17 +37,30 @@
       var s = x.d || {}, srcs = s.defaultSources || [];
       push('【服务】/api/status ' + x.code + ' · ' + (s.verified ? '已登录' : '未登录')
         + ' · 服务端预置源 ' + srcs.length + ' 条');
-      if (!srcs.length) {
-        var n = 0;
-        try {
-          var q = JSON.parse(localStorage.getItem('libretv-settings') || 'null');
-          n = q && q.state && Array.isArray(q.state.customAPIs) ? q.state.customAPIs.length : 0;
-        } catch (e) { }
-        push('【源】网页本地源 ' + n + ' 条；服务端没有预置源，请配置 DEFAULT_SOURCES');
+      var localApis = [];
+      try {
+        var q = JSON.parse(localStorage.getItem('libretv-settings') || 'null');
+        var st = q && q.state ? q.state : {};
+        var apis = Array.isArray(st.customAPIs) ? st.customAPIs : [];
+        var selected = Array.isArray(st.selectedKeys) ? st.selectedKeys : [];
+        if (selected.length) {
+          var set = {};
+          selected.forEach(function (k) { set[k] = 1; });
+          localApis = apis.filter(function (a) { return a && set[a.key] && a.url; });
+        }
+        if (!localApis.length) {
+          localApis = apis.filter(function (a) { return a && a.url; });
+        }
+      } catch (e) { }
+      if (!srcs.length && !localApis.length) {
+        push('【源】网页本地源 0 条；服务端与浏览器都没有可用源，请先导入源配置');
         finish();
         return null;
       }
-      var use = srcs.slice(0, 8);
+      if (!srcs.length) {
+        push('【源】服务端无预置源，将使用网页本地已选源（' + localApis.length + ' 条）实测');
+      }
+      var use = (srcs.length ? srcs : localApis).slice(0, 8);
       var first = use[0];
 
       var pSearch = fetchT('/api/search', {

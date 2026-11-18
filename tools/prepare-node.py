@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
-为 APK 准备「手机本地运行 LibreTV 服务」所需的 Node.js 运行时。
+为 APK 准备「手机本地运行 LibreTV 服务」所需的 Node.js 运行时与前端补丁。
 
-产出的文件全部是构建期第三方二进制，不入库（见 .gitignore）：
-  app/src/main/jniLibs/arm64-v8a/*.so   Node 可执行文件 + 其动态依赖
-  app/src/main/assets/libretv-standalone.bin     官方 LibreTV 2.22.0 standalone（tar.gz）
-  app/src/main/assets/node-runtime.json           运行时清单（供 Java 读取）
+产出的文件全部是构建期第三方二进制或二次打补丁产物，不入库（见 .gitignore）：
+  app/src/main/jniLibs/arm64-v8a/*.so      Node 可执行文件 + 其动态依赖
+  app/src/main/assets/libretv-standalone.bin  LibreTV 2.22.0 standalone（默认经 HLS/播放器/极光 UI 补丁并以 XZ 打包）
+  app/src/main/assets/node-runtime.json       运行时清单（供 Java 读取）
 
-原理与关键约束：
-  * LibreTV 是 Next.js 15 服务端应用，18 个 /api 路由无法在 Java 侧重写，
-    所以手机必须真的跑一个 Node.js 进程。
-  * Termux 官方 aarch64 包里的 node 是标准 Android ELF（interpreter
-    /system/bin/linker64），依赖 Bionic 动态库，无原生 addon 需求。
-  * Android 10+ 不允许应用从私有数据目录 exec/dlopen 代码，唯一稳妥位置是
-    nativeLibraryDir，因此二进制必须以 lib*.so 命名放进 jniLibs，并开启
-    extractNativeLibs（见 AndroidManifest.xml / app/build.gradle）。
-  * Termux 的 DT_NEEDED 里有带版本号的名字（libz.so.1、libicuuc.so.79 …），
-    这类文件名不是 .so 结尾，系统不会解压。这里把 ELF .dynstr 中的字符串
-    原地改短成 .so 结尾（新名不长于原名，等长补 \\0，不改变文件长度），
-    再把文件重命名，让 linker 能在 nativeLibraryDir 里找到它们。
-  * ELF 只有 DT_RUNPATH 指向 Termux 路径，LD_LIBRARY_PATH 优先于 RUNPATH，
-    Java 侧把 LD_LIBRARY_PATH 设为 nativeLibraryDir 即可覆盖。
-
-下载走清华 TUNA Termux 镜像，缓存在 /tmp/libretv-node-cache，可离线复跑。
+说明：
+  * 从清华 TUNA Termux 镜像抓取 aarch64 Node.js 与依赖库，改写 ELF .dynstr 短库名以适配 Android nativeLibraryDir。
+  * 从上游 LibreTV v2.22.0 Release 获取 standalone 包（也可通过 --standalone / LIBRETV_STANDALONE_TAR 指定本地离线包）。
+  * 默认调用同目录 patch_hls.patch_archive() 注入 HLS 403 本地反代、播放器控制、稳健性补丁与 Aurora 极光 UI，并裁剪构建期 TypeScript、以 XZ 压缩。
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import io
@@ -35,20 +24,25 @@ import os
 import shutil
 import sys
 import tarfile
+import tempfile
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
+TOOLS_DIR = Path(__file__).resolve().parent
+ROOT = TOOLS_DIR.parent
 JNI = ROOT / "app/src/main/jniLibs/arm64-v8a"
 ASSETS = ROOT / "app/src/main/assets"
-CACHE = Path(os.environ.get("LIBRETV_NODE_CACHE", "/tmp/libretv-node-cache"))
+DEFAULT_CACHE = Path(tempfile.gettempdir()) / "libretv-node-cache"
+CACHE = Path(os.environ.get("LIBRETV_NODE_CACHE", str(DEFAULT_CACHE)))
 
 MIRROR = "https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main/"
 PACKAGES_GZ = MIRROR + "dists/stable/main/binary-aarch64/Packages.gz"
+STANDALONE_URL = (
+    "https://github.com/LibreSpark/LibreTV/releases/download/v2.22.0/"
+    "libretv-2.22.0-standalone.tar.gz"
+)
 NODE_PKG = "nodejs-lts"
 DEP_PKGS = ["libc++", "openssl", "c-ares", "libicu", "libsqlite", "zlib"]
-STANDALONE = WORKSPACE / "libretv-install/libretv-2.22.0-standalone.tar.gz"
 
 # DT_NEEDED / SONAME 原名 -> 打包后的短名（长度必须不增加）
 RENAME = {
@@ -154,6 +148,12 @@ def patch_elf(data: bytes) -> bytes:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="准备 LibreTV Android 开源版 Node 运行时")
+    parser.add_argument("--standalone", type=Path, help="本地 libre-tv standalone tar.gz 路径（可选）")
+    parser.add_argument("--icu-data-lib", type=Path, help="预先裁剪好的 arm64 libicudata.so（可选）")
+    parser.add_argument("--raw-runtime", action="store_true", help="跳过 HLS/UI 补丁与 XZ 重打包，保留上游原包")
+    args = parser.parse_args()
+
     CACHE.mkdir(parents=True, exist_ok=True)
     JNI.mkdir(parents=True, exist_ok=True)
     ASSETS.mkdir(parents=True, exist_ok=True)
@@ -199,13 +199,23 @@ def main() -> int:
         return 1
     pool["__NODE_BINARY__"] = (node_raw, False, "")
 
+    icu_override = args.icu_data_lib or (
+        Path(os.environ["LIBRETV_ICU_DATA_LIB"]) if os.environ.get("LIBRETV_ICU_DATA_LIB") else None
+    )
+
     written = []
     for out_name, logical in WANT.items():
-        raw = resolve(pool, logical)
-        if raw is None:
-            log("错误：缺少库 " + logical + " -> " + out_name)
-            return 1
-        raw = patch_elf(raw)
+        if out_name == "libicudata.so" and icu_override:
+            if not icu_override.is_file():
+                log("错误：找不到 --icu-data-lib 文件: " + str(icu_override))
+                return 1
+            raw = icu_override.read_bytes()
+        else:
+            raw = resolve(pool, logical)
+            if raw is None:
+                log("错误：缺少库 " + logical + " -> " + out_name)
+                return 1
+            raw = patch_elf(raw)
         (JNI / out_name).write_bytes(raw)
         try:
             os.chmod(JNI / out_name, 0o755)
@@ -215,30 +225,53 @@ def main() -> int:
         log("  %-24s %8.1f MB" % (out_name, len(raw) / 1048576))
 
     # LibreTV standalone 运行包
-    if not STANDALONE.exists():
-        log("错误：找不到官方运行包 " + str(STANDALONE))
-        return 1
-    # 必须用 .bin 后缀：aapt 会自动 gunzip assets 里的 *.gz 并去掉后缀，
-    # 导致 Java 侧按 tar.gz 读取时拿到的是裸 tar 且文件名对不上。
-    runtime_name = "libretv-standalone.bin"
-    shutil.copy2(STANDALONE, ASSETS / runtime_name)
+    env_sa = os.environ.get("LIBRETV_STANDALONE_TAR")
+    standalone = args.standalone or (Path(env_sa) if env_sa else CACHE / "libretv-2.22.0-standalone.tar.gz")
+    if not standalone.is_file():
+        if args.standalone or env_sa:
+            log("错误：找不到指定的运行包 " + str(standalone))
+            return 1
+        fetch(STANDALONE_URL, standalone)
 
+    raw_blob = standalone.read_bytes()
+    if args.raw_runtime:
+        final_blob = raw_blob
+    else:
+        sys.path.insert(0, str(TOOLS_DIR))
+        from patch_hls import patch_archive
+        log("应用开源版 HLS 反代 + 播放器控制 + 稳健性 + 极光 UI 补丁（XZ 打包）...")
+        final_blob = patch_archive(
+            raw_blob,
+            player_controls=True,
+            prune_typescript=True,
+            runtime_xz=True,
+        )
+
+    # 必须用 .bin 后缀：aapt 会自动 gunzip assets 里的 *.gz 并去掉后缀
+    runtime_name = "libretv-standalone.bin"
+    (ASSETS / runtime_name).write_bytes(final_blob)
+
+    runtime_sha = hashlib.sha256(final_blob).hexdigest()
     manifest = {
         "abi": "arm64-v8a",
         "nodeVersion": node_version,
         "nodeLib": "libnode.so",
         "libs": written,
         "runtimeArchive": runtime_name,
-        "runtimeSha256": hashlib.sha256(STANDALONE.read_bytes()).hexdigest(),
+        "runtimeSha256": runtime_sha,
         "defaultPort": 8899,
+        "patched": not args.raw_runtime,
         "note": "构建期生成的第三方运行时清单，二进制文件本身不入库",
     }
     (ASSETS / "node-runtime.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     total = sum((JNI / n).stat().st_size for n in written)
-    log("完成：%d 个 ELF，合计 %.1f MB（未压缩）" % (len(written), total / 1048576))
-    log("运行包 %s，SHA256 %s" % (runtime_name, manifest["runtimeSha256"][:16]))
+    log("完成：%d 个 ELF，合计 %.1f MB（未压缩）；运行包 %.2f MB" % (
+        len(written), total / 1048576, len(final_blob) / 1048576
+    ))
+    log("运行包 %s，SHA256 %s" % (runtime_name, runtime_sha[:16]))
     return 0
 
 

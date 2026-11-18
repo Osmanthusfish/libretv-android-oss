@@ -23,6 +23,7 @@
   var UI_ROW_ID = 'ltv-top-actions';
   var UI_EXIT_ID = 'ltv-exit-btn';
   var UI_CAST_ID = 'ltv-cast-btn';
+  var UI_PLAYBACK_ID = 'ltv-playback-btn';
   /* null = 跟随全屏判定；true/false = 原生显式指定（见 window.__ltv.setUiVisible） */
   var uiVisibleOverride = null;
   var castLabel = '投屏';
@@ -45,26 +46,76 @@
   var lastVideo = null;
   var lastReport = 0;
   var streamUrl = '';
+  var streamPage = '';
+  var hudIdleTimer = null;
+  var HUD_IDLE_MS = 4000;
+  var tempRateActive = false;
+  var tempRateSaved = 1;
+  var controlsHideTimer = null;
+
+  function prefersReducedMotion() {
+    try {
+      return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    } catch (e) { return false; }
+  }
+
+  function wakeHud() {
+    try {
+      if (hudIdleTimer) { clearTimeout(hudIdleTimer); hudIdleTimer = null; }
+      var rootEl = document.documentElement;
+      if (!isFullscreen()) {
+        rootEl.removeAttribute('data-ltv-hud');
+        return;
+      }
+      rootEl.setAttribute('data-ltv-hud', 'awake');
+      var v = vid();
+      if (!playbackPanel && !castPanelOpen && v && !v.paused) {
+        hudIdleTimer = setTimeout(function () {
+          hudIdleTimer = null;
+          var curV = vid();
+          if (isFullscreen() && !playbackPanel && !castPanelOpen && curV && !curV.paused) {
+            document.documentElement.setAttribute('data-ltv-hud', 'idle');
+          }
+        }, HUD_IDLE_MS);
+      }
+    } catch (e) { }
+  }
 
   // ---------------------------------------------------------------- 投屏：捕获视频直链
   // 电视无法播放 WebView 里的 blob: 地址，必须拿到原始 m3u8/mp4 URL。
   // hls.js 用 XHR 拉清单与分片，少数直连走 fetch，这里在最早注入点包装两者。
+  function castStreamUrl(input) {
+    var url = new URL(String(input), location.href);
+    for (var depth = 0; depth < 2; depth++) {
+      if (url.origin === location.origin
+          && (url.pathname === '/api/proxy' || url.pathname === '/api/live/stream')) {
+        var raw = url.searchParams.get('url');
+        if (!raw) break;
+        url = new URL(raw, location.href);
+      } else {
+        break;
+      }
+    }
+    return /^https?:$/.test(url.protocol) ? url.href : '';
+  }
   function looksLikeStream(u) {
     if (!u) return false;
     var s = String(u);
     if (s.indexOf('blob:') === 0 || s.indexOf('data:') === 0) return false;
+    if (/\/api\/live\/stream\b/i.test(s)) return true;
     if (/\.(m3u8|mp4|flv|mkv|avi)(\?|#|&|$)/i.test(s)) return true;
     /* 服务端代理：/api/proxy?url=xxx.m3u8 */
-    if (/[?&](url|src|u)=/i.test(s) && /m3u8|mp4/i.test(s)) return true;
+    if (/\/api\/proxy\b/i.test(s) && /[?&](url|src|u)=/i.test(s)) return true;
+    if (/[?&](url|src|u)=/i.test(s) && /m3u8|mp4|flv/i.test(s)) return true;
     return false;
   }
   function reportStream(u) {
     if (!looksLikeStream(u)) return;
     try {
-      var abs = new URL(String(u), location.href).href;
+      var abs = castStreamUrl(u);
+      if (!abs) return;
       streamUrl = abs;
-      var fn = bridge('onStream');
-      if (fn) { try { fn(abs); } catch (e) { } }
+      streamPage = location.href;
     } catch (e) { }
   }
   try {
@@ -113,12 +164,12 @@
     } catch (e) { return null; }
   }
 
-  /** 直接调一次原生方法，返回是否调用成功（失败原因不抛给调用方） */
-  function callBridge(name, a, b2, c) {
+  /** 直接调一次原生方法，只转发实际传入的参数（Android @JavascriptInterface 严格校验参数个数） */
+  function callBridge(name) {
     var fn = bridge(name);
     if (!fn) return false;
     try {
-      fn(a, b2, c);
+      fn.apply(null, Array.prototype.slice.call(arguments, 1));
       return true;
     } catch (e) { return false; }
   }
@@ -179,9 +230,10 @@
         row.id = UI_ROW_ID;
         row.setAttribute('data-ltv', 'actions');
 
-        var btn = document.createElement('div');
+        var btn = document.createElement('button');
+        btn.type = 'button';
         btn.id = UI_EXIT_ID;
-        btn.textContent = '✕ 退出全屏';
+        btn.textContent = '退出全屏';
         var onExit = function (e) {
           if (e) {
             if (e.preventDefault) e.preventDefault();
@@ -193,13 +245,13 @@
           try { window.__ltv.exit(); } catch (e2) { }
         };
         btn.addEventListener('click', onExit, true);
-        btn.addEventListener('touchend', onExit, true);
         row.appendChild(btn);
 
         /* 投屏：先在网页里把面板打开（用户立刻看到反应），再让原生去搜设备。
            之前只调 bridge('cast')，原生弹的是系统对话框 —— 播放态下这台设备
            的原生覆盖层不上屏，用户看到的就是「点了没反应」。 */
-        var castBtn = document.createElement('div');
+        var castBtn = document.createElement('button');
+        castBtn.type = 'button';
         castBtn.id = UI_CAST_ID;
         castBtn.textContent = castLabel;
         castBtn.setAttribute('data-ltv', 'cast');
@@ -215,8 +267,17 @@
           if (lg) { try { lg('网页内投屏入口不可用（没有原生桥）'); } catch (e3) { } }
         };
         castBtn.addEventListener('click', onCast, true);
-        castBtn.addEventListener('touchend', onCast, true);
         row.appendChild(castBtn);
+
+        var playback = document.createElement('button');
+        playback.type = 'button';
+        playback.id = UI_PLAYBACK_ID;
+        playback.textContent = '播放设置';
+        playback.addEventListener('click', function (e) {
+          stop(e);
+          showPlaybackOptions();
+        });
+        row.appendChild(playback);
 
         wrap.appendChild(row);
         document.body.appendChild(wrap);
@@ -235,7 +296,221 @@
     var wrap = q('#' + UI_WRAP_ID);
     if (!wrap) return;
     var show = uiVisibleOverride === null ? isFullscreen() : !!uiVisibleOverride;
+    var playback = q('#' + UI_PLAYBACK_ID);
+    if (playback) playback.hidden = !vid();
+    if (!show) closePlaybackOptions(true);
     wrap.style.display = show ? 'block' : 'none';
+  }
+
+  var playbackPanel = null;
+  var playbackBackdrop = null;
+  var playbackClosingNodes = [];
+  var speeds = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+
+  function finishAnimationWait(nodes, done) {
+    if (prefersReducedMotion()) { done(); return; }
+    var anims = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n && typeof n.getAnimations === 'function') {
+        var list = n.getAnimations();
+        for (var j = 0; j < list.length; j++) anims.push(list[j]);
+      }
+    }
+    if (anims.length === 0) { done(); return; }
+    var settled = false;
+    var finish = function () { if (!settled) { settled = true; done(); } };
+    var timer = setTimeout(finish, 200);
+    Promise.all(anims.map(function (a) {
+      return a.finished ? a.finished.catch(function () { }) : Promise.resolve();
+    })).then(function () { clearTimeout(timer); finish(); }, function () { clearTimeout(timer); finish(); });
+  }
+
+  function flushClosingPlaybackNodes() {
+    while (playbackClosingNodes.length) {
+      var n = playbackClosingNodes.pop();
+      try { if (n && n.parentNode) n.remove(); } catch (e) { }
+    }
+  }
+
+  function closePlaybackOptions(immediate) {
+    if (immediate) flushClosingPlaybackNodes();
+    if (!playbackPanel) return;
+    var panel = playbackPanel;
+    var backdrop = playbackBackdrop;
+    playbackPanel = null;
+    playbackBackdrop = null;
+    callBridge('playbackPanel', false);
+    var trigger = q('#' + UI_PLAYBACK_ID);
+    if (trigger && isFullscreen()) {
+      try { trigger.focus({ preventScroll: true }); } catch (e) { }
+    }
+    wakeHud();
+    if (immediate || prefersReducedMotion()) {
+      try { if (panel && panel.parentNode) panel.remove(); } catch (e) { }
+      try { if (backdrop && backdrop.parentNode) backdrop.remove(); } catch (e) { }
+      return;
+    }
+    try { getComputedStyle(panel).opacity; } catch (e) { }
+    panel.setAttribute('data-closing', '1');
+    if (backdrop) backdrop.setAttribute('data-closing', '1');
+    playbackClosingNodes.push(panel);
+    if (backdrop) playbackClosingNodes.push(backdrop);
+    finishAnimationWait([panel, backdrop], function () {
+      try { if (panel && panel.parentNode) panel.remove(); } catch (e) { }
+      try { if (backdrop && backdrop.parentNode) backdrop.remove(); } catch (e) { }
+    });
+  }
+
+  function showPlaybackOptions() {
+    closePlaybackOptions(true);
+    var video = vid();
+    if (!video) return;
+    var panel = document.createElement('div');
+    panel.id = 'ltv-playback-options';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', '播放设置');
+    playbackPanel = panel;
+    wakeHud();
+    function button(parent, label, action, active, keepOpen) {
+      var el = document.createElement('button');
+      el.type = 'button';
+      el.textContent = label;
+      if (active !== undefined) el.setAttribute('aria-pressed', String(active));
+      el.addEventListener('click', function (e) {
+        stop(e);
+        if (!keepOpen) closePlaybackOptions(false);
+        action();
+      });
+      parent.appendChild(el);
+      return el;
+    }
+    function row(label) {
+      var title = document.createElement('h3');
+      title.textContent = label;
+      var buttons = document.createElement('div');
+      buttons.className = 'ltv-option-grid';
+      body.appendChild(title);
+      body.appendChild(buttons);
+      return buttons;
+    }
+    var heading = document.createElement('header');
+    var title = document.createElement('h2');
+    title.textContent = '播放设置';
+    heading.appendChild(title);
+    var close = button(heading, '关闭', function () { });
+    panel.appendChild(heading);
+    var watch = window.__ltvWatch;
+    var actions = document.createElement('div');
+    actions.className = 'ltv-option-grid ltv-playback-actions';
+    if (watch) {
+      button(actions, '切换线路', function () {
+        var exit = bridge('exitFullscreen');
+        if (exit) exit(); else window.__ltv.exit();
+        watch.switchSource();
+      });
+    }
+    if (bridge('requestPictureInPicture')) {
+      button(actions, '画中画', function () { callBridge('requestPictureInPicture'); });
+    }
+    if (actions.childElementCount) panel.appendChild(actions);
+    var body = document.createElement('div');
+    body.className = 'ltv-options-body';
+    panel.appendChild(body);
+    var rates = row('倍速');
+    speeds.forEach(function (rate) {
+      button(rates, rate + '×', function () {
+        video.defaultPlaybackRate = rate;
+        video.playbackRate = rate;
+        tempRateActive = false;
+        tempRateSaved = rate;
+        try { localStorage.setItem('ltv-playback-rate', String(rate)); } catch (e) { }
+        Array.prototype.forEach.call(rates.children, function (item, i) {
+          item.setAttribute('aria-pressed', String(speeds[i] === rate));
+        });
+      }, rate === video.playbackRate, true);
+    });
+    if (watch && watch.count > 0) {
+      var epTitle = document.createElement('h3');
+      epTitle.textContent = '选集（共 ' + watch.count + ' 集）';
+      body.appendChild(epTitle);
+      var episodes = document.createElement('div');
+      episodes.className = 'ltv-option-grid ltv-episode-grid';
+      if (watch.count >= 45) {
+        var rangesWrap = document.createElement('div');
+        rangesWrap.className = 'ltv-ep-ranges';
+        rangesWrap.setAttribute('role', 'tablist');
+        rangesWrap.setAttribute('aria-label', '选集分段');
+        var chunk = 50;
+        var rangeBtns = [];
+        for (var start = 0; start < watch.count; start += chunk) {
+          (function (sIdx, eIdx) {
+            var rBtn = document.createElement('button');
+            rBtn.type = 'button';
+            rBtn.textContent = (sIdx + 1) + '-' + eIdx;
+            var isCurRange = watch.index >= sIdx && watch.index < eIdx;
+            rBtn.setAttribute('aria-pressed', String(isCurRange));
+            rBtn.addEventListener('click', function (e) {
+              stop(e);
+              for (var k = 0; k < rangeBtns.length; k++) {
+                rangeBtns[k].setAttribute('aria-pressed', String(rangeBtns[k] === rBtn));
+              }
+              var targetEp = episodes.children[sIdx];
+              if (targetEp && targetEp.scrollIntoView) {
+                try { targetEp.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' }); }
+                catch (err) { targetEp.scrollIntoView(true); }
+              }
+            });
+            rangeBtns.push(rBtn);
+            rangesWrap.appendChild(rBtn);
+          })(start, Math.min(watch.count, start + chunk));
+        }
+        body.appendChild(rangesWrap);
+      }
+      var frag = document.createDocumentFragment();
+      for (var index = 0; index < watch.count; index++) {
+        (function (episode) {
+          button(frag, '第' + (episode + 1) + '集', function () {
+            if (window.__ltvWatch === watch) watch.select(episode);
+          }, episode === watch.index);
+        })(index);
+      }
+      episodes.appendChild(frag);
+      body.appendChild(episodes);
+    }
+    panel.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') {
+        stop(event);
+        closePlaybackOptions(false);
+      } else if (event.key === 'Tab') {
+        var buttons = panel.querySelectorAll('button');
+        var first = buttons[0], last = buttons[buttons.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          stop(event); last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          stop(event); first.focus();
+        }
+      }
+    });
+    playbackBackdrop = document.createElement('div');
+    playbackBackdrop.className = 'ltv-playback-backdrop';
+    playbackBackdrop.addEventListener('click', function (event) {
+      stop(event);
+      closePlaybackOptions(false);
+    });
+    q('#' + UI_WRAP_ID).appendChild(playbackBackdrop);
+    q('#' + UI_WRAP_ID).appendChild(panel);
+    callBridge('playbackPanel', true);
+    close.focus({ preventScroll: true });
+    var activeEp = panel.querySelector('.ltv-episode-grid button[aria-pressed="true"]');
+    if (activeEp && activeEp.scrollIntoView && (!watch || watch.index > 0)) {
+      try {
+        requestAnimationFrame(function () {
+          try { activeEp.scrollIntoView({ block: 'nearest' }); } catch (e) { }
+        });
+      } catch (e) { }
+    }
   }
 
   // ---------------------------------------------------------------- 投屏面板（也画在网页里）
@@ -320,6 +595,15 @@
   function seq(v) { var n = Number(v); return isFinite(n) && n > 0 ? n : 0; }
 
   /** 只刷新进度条与时间文字，不重建面板（轮询每 2 秒都会来一次） */
+  function syncCastSliderVars(bar, pos, dur) {
+    if (!bar) return;
+    var maxVal = Math.max(1, Number(bar.max) || Math.round(seq(dur)) || 1);
+    var p = seq(pos);
+    var pct = Math.max(0, Math.min(100, (p / maxVal) * 100));
+    bar.style.setProperty('--slider-progress', pct.toFixed(2) + '%');
+    bar.setAttribute('aria-valuetext', fmtT(p) + ' / ' + fmtT(seq(dur)));
+  }
+
   function paintCastBar(pos, dur) {
     var bar = q('#ltv-cast-range');
     var lab = q('#ltv-cast-time');
@@ -329,8 +613,9 @@
     }
     var p = seq(pos);
     if (bar && !bar.__dragging) bar.value = String(Math.round(p));
+    var shown = bar && bar.__dragging ? seq(bar.value) : p;
+    if (bar) syncCastSliderVars(bar, shown, d);
     if (lab) {
-      var shown = bar && bar.__dragging ? seq(bar.value) : p;
       lab.textContent = fmtT(shown) + ' / ' + fmtT(d);
     }
   }
@@ -348,18 +633,18 @@
   }
 
   /**
-   * 两次轮询之间（2 秒一次）本地外推进度，进度条不会一跳一跳。
+   * 两次轮询之间（2 秒一次）本地 4Hz 外推进度，滑块填充与时间流畅前进。
    * 暂停时不动；拿到新的上报值就以新值为准。
    */
   function startCastTick() {
     if (castTick) return;
     castTick = setInterval(function () {
-      if (!castActive) return;
+      if (!castActive || !castPanelOpen) return;
       if (castPaused) return;
       if (!(castPosAt > 0) || !(castDur > 0)) return;
       var p = castPos + (Date.now() - castPosAt) / 1000;
       paintCastBar(p > castDur ? castDur : p, castDur);
-    }, 1000);
+    }, 250);
   }
   function stopCastTick() {
     if (castTick) { try { clearInterval(castTick); } catch (e) { } }
@@ -410,15 +695,19 @@
     var bar = document.createElement('input');
     bar.type = 'range';
     bar.id = 'ltv-cast-range';
+    bar.setAttribute('aria-label', '投屏播放进度');
     bar.min = '0';
     bar.max = String(Math.max(1, Math.round(seq(castDur) || 1)));
     bar.step = '1';
     bar.value = String(Math.round(seq(castPos)));
+    syncCastSliderVars(bar, castPos, castDur);
     /* 拖动期间不让轮询回写覆盖用户的手指位置 */
     bar.addEventListener('input', function () {
       bar.__dragging = true;
+      var cur = seq(bar.value);
+      syncCastSliderVars(bar, cur, castDur);
       var lab = q('#ltv-cast-time');
-      if (lab) lab.textContent = fmtT(seq(bar.value)) + ' / ' + fmtT(castDur);
+      if (lab) lab.textContent = fmtT(cur) + ' / ' + fmtT(castDur);
     }, true);
     var commit = function () {
       bar.__dragging = false;
@@ -558,21 +847,41 @@
   function castShow(state, data) {
     ensureCastUi();
     var wrap = q('#' + CAST_ID);
-    if (wrap) { wrap.style.display = 'flex'; castPanelOpen = true; }
+    if (wrap) {
+      wrap.removeAttribute('data-closing');
+      wrap.style.display = 'flex';
+      castPanelOpen = true;
+    }
+    wakeHud();
     /* 面板打开时手势层必须让开：整屏都可能被点到（设备行 / 按钮） */
     var cb = bridge('castPanel');
     if (cb) { try { cb(true); } catch (e) { } }
     castRender(state || 'scanning', data);
   }
 
-  function castHide() {
+  function castHide(immediate) {
     var wrap = q('#' + CAST_ID);
-    if (wrap) wrap.style.display = 'none';
     castPanelOpen = false;
     /* 面板收起就停止本地外推：没必要在后台每秒算一次进度 */
     stopCastTick();
     var cb = bridge('castPanel');
     if (cb) { try { cb(false); } catch (e) { } }
+    wakeHud();
+    if (!wrap) return;
+    if (immediate || prefersReducedMotion()) {
+      wrap.removeAttribute('data-closing');
+      wrap.style.display = 'none';
+      return;
+    }
+    var card = q('#ltv-cast-card');
+    try { getComputedStyle(wrap).opacity; } catch (e) { }
+    wrap.setAttribute('data-closing', '1');
+    finishAnimationWait([wrap, card], function () {
+      if (!castPanelOpen) {
+        wrap.removeAttribute('data-closing');
+        wrap.style.display = 'none';
+      }
+    });
   }
 
   // ---------------------------------------------------------------- 样式
@@ -596,16 +905,44 @@
          表现就是「进度条和控制菜单叠在一起，怎么都选不中」。
          粗细必须走 ArtPlayer 自己的变量 --art-progress-height。 */
       '.art-video-player { --art-progress-height: 8px !important; }',
-      '.art-control-progress { min-height: 34px !important; position: relative !important; }',
+      '.art-control-progress { min-height: 32px !important; position: relative !important; }',
       '.art-control-progress::before {',
       '  content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -12px;',
       '}',
-      '.art-progress-indicator { width: 16px !important; height: 16px !important; }',
+      '.art-control-progress .art-control-progress-inner {',
+      '  height: 4px !important; border-radius: 999px !important;',
+      '  background-color: rgba(255,255,255,0.24) !important;',
+      '  transition: height 160ms cubic-bezier(0.22, 1, 0.36, 1) !important;',
+      '}',
+      '.art-control-progress:hover .art-control-progress-inner,',
+      '.art-control-progress:active .art-control-progress-inner {',
+      '  height: 6px !important;',
+      '}',
+      '.art-control-progress .art-control-progress-inner .art-progress-loaded {',
+      '  background-color: rgba(255,255,255,0.40) !important; border-radius: inherit !important;',
+      '}',
+      '.art-control-progress .art-control-progress-inner .art-progress-played {',
+      '  background: linear-gradient(90deg, #00c8f8 0%, #3b82f6 100%) !important; border-radius: inherit !important;',
+      '}',
+      '.art-progress-indicator {',
+      '  width: 14px !important; height: 14px !important; border-radius: 50% !important;',
+      '  background: #ffffff !important; border: 2px solid #00c8f8 !important;',
+      '  box-shadow: 0 0 0 4px rgba(0,200,248,0.25), 0 2px 6px rgba(0,0,0,0.5) !important;',
+      '  transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1) !important;',
+      '}',
+      '.art-control-progress:active .art-progress-indicator { transform: scale(1.22) !important; }',
+      '.art-video-player .art-bottom { transition: opacity 220ms cubic-bezier(0.22, 1, 0.36, 1) !important; }',
+      '.art-video-player .art-bottom .art-controls, .art-video-player .art-bottom .art-progress {',
+      '  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1) !important;',
+      '}',
       /* 迷你进度条态：LibreTV 在控制栏收起时给播放器加 art-mini-progress-bar，
-         只留一条指示线。那时不能再用上面那套「撑高到 34px 方便手指」的规则，
+         只留一条指示线。那时不能再用上面那套「撑高方便手指」的规则，
          否则底边会出现一条又厚又容易误跳进度的热区，还正好压在系统手势条上。 */
       '.art-video-player.art-mini-progress-bar { --art-progress-height: 5px !important; }',
       '.art-video-player.art-mini-progress-bar .art-control-progress { min-height: 0 !important; }',
+      '.art-video-player.art-mini-progress-bar .art-control-progress .art-control-progress-inner {',
+      '  height: 3px !important; border-radius: 0 !important;',
+      '}',
       '.art-video-player.art-mini-progress-bar .art-control-progress::before { display: none !important; }',
       /* --- 控制按钮：全部状态放大触摸目标 --- */
       '.art-control { min-width: 48px !important; min-height: 48px !important; }',
@@ -617,8 +954,11 @@
       '  --art-control-icon-scale: 1.5 !important;',
       '  --art-control-icon-size: 30px !important;',
       '  --art-progress-height: 10px !important;',
-      '  --art-indicator-size: 28px !important;',
+      '  --art-indicator-size: 18px !important;',
       '  --art-bottom-height: 68px !important;',
+      '}',
+      '.art-fullscreen .art-progress-indicator, .art-fullscreen-web .art-progress-indicator {',
+      '  width: 18px !important; height: 18px !important;',
       '}',
       /* 网页控制栏交回 ArtPlayer 自己的「轻触显示 / 自动隐藏」。
          以前这里有一条 html.ltv-native-bar，把 .art-bottom / .art-controls 整体压掉，
@@ -682,75 +1022,170 @@
       /* 按钮行：左上角，横排。安全区兜底 —— 横屏挖孔在左、竖屏刘海在上，
          env() 取不到时回落 0，不影响常规机型。 */
       '#ltv-top-actions { position: absolute !important; display: flex !important;',
-      '  align-items: center !important; gap: 8px !important;',
+      '  align-items: center !important; flex-wrap: wrap !important; gap: 8px !important;',
+      '  max-width: calc(100vw - 82px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) !important;',
       '  top: calc(12px + env(safe-area-inset-top, 0px)) !important;',
       '  left: calc(14px + env(safe-area-inset-left, 0px)) !important;',
+      '  transition: opacity 320ms cubic-bezier(0.22, 1, 0.36, 1);',
       '  pointer-events: none !important; }',
-      '#ltv-exit-btn, #ltv-cast-btn { pointer-events: auto !important; cursor: pointer;',
-      '  padding: 9px 15px !important; border-radius: 999px !important;',
-      '  background: rgba(0,0,0,0.62) !important; color: #fff !important;',
+      'html.ltv-fs[data-ltv-hud="idle"] #ltv-top-actions { opacity: 0.44; }',
+      '#ltv-exit-btn, #ltv-cast-btn, #ltv-playback-btn { pointer-events: auto !important; cursor: pointer;',
+      '  padding: 9px 14px !important; border-radius: 999px !important;',
+      '  border: 1px solid rgba(186,214,255,0.22) !important;',
+      '  background: rgba(15,22,36,0.74) !important; color: #f8fbff !important;',
+      '  backdrop-filter: blur(16px) saturate(165%); -webkit-backdrop-filter: blur(16px) saturate(165%);',
       '  font: 500 13px/1.15 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif !important;',
-      '  letter-spacing: .3px; white-space: nowrap;',
-      '  box-shadow: 0 2px 10px rgba(0,0,0,.45); -webkit-user-select: none; user-select: none;',
+      '  letter-spacing: .3px; white-space: nowrap; min-height: 44px;',
+      '  box-shadow: 0 8px 22px rgba(0,0,0,.46), inset 0 1px 0 rgba(255,255,255,0.14);',
+      '  transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.2s ease, border-color 0.2s ease;',
+      '  -webkit-user-select: none; user-select: none;',
       '}',
-      /* 投屏用绿色：和「退出」区分开，也提示它是一个动作而不是返回 */
-      '#ltv-cast-btn { background: rgba(47,163,107,0.88) !important; }',
-      /* 投屏中：文字换成「投屏中」，颜色更深，暗示点进去是管理而不是重新搜设备 */
-      '#ltv-cast-btn[data-casting="1"] { background: rgba(35,120,80,0.92) !important; }',
+      '@keyframes ltvBackdropIn { from { opacity: 0; } to { opacity: 1; } }',
+      '@keyframes ltvSheetOpacity { from { opacity: 0; } to { opacity: 1; } }',
+      '@keyframes ltvSheetTransform { from { transform: translateX(-50%) translateY(18px) scale(0.96); } to { transform: translateX(-50%) translateY(0) scale(1); } }',
+      '@keyframes ltvCardOpacity { from { opacity: 0; } to { opacity: 1; } }',
+      '@keyframes ltvCardTransform { from { transform: translateY(16px) scale(0.95); } to { transform: translateY(0) scale(1); } }',
+      '@keyframes ltvCastRadar {',
+      '  0% { transform: scale(0.96); opacity: 0.78; }',
+      '  75% { transform: scale(1.18, 1.32); opacity: 0; }',
+      '  100% { transform: scale(1.18, 1.32); opacity: 0; }',
+      '}',
+      '#ltv-exit-btn:active, #ltv-cast-btn:active, #ltv-playback-btn:active,',
+      '#ltv-playback-options button:active, .ltv-cast-btn2:active { transform: scale(0.95); }',
+      '.ltv-playback-backdrop { pointer-events: auto; position: absolute; inset: 0;',
+      '  background: rgba(5,9,17,0.62); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);',
+      '  animation: ltvBackdropIn 180ms ease-out both; transition: opacity 170ms ease-out; }',
+      '.ltv-playback-backdrop[data-closing="1"] { animation: none; opacity: 0; pointer-events: none !important; }',
+      '#ltv-playback-options { pointer-events: auto; position: absolute; display: flex; flex-direction: column;',
+      '  left: 50%; bottom: max(12px, env(safe-area-inset-bottom)); transform: translateX(-50%);',
+      '  width: min(480px, calc(100vw - 24px)); max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); box-sizing: border-box;',
+      '  overflow: hidden; contain: layout style paint; padding: 14px; border: 1px solid rgba(148,185,255,0.22); border-radius: 18px;',
+      '  background: rgba(14,21,34,0.90); color: #eef5ff;',
+      '  backdrop-filter: blur(26px) saturate(175%); -webkit-backdrop-filter: blur(26px) saturate(175%);',
+      '  box-shadow: 0 24px 64px rgba(0,0,0,0.72), inset 0 1px 0 rgba(255,255,255,0.12);',
+      '  animation: ltvSheetOpacity 180ms ease-out both, ltvSheetTransform 260ms cubic-bezier(0.22, 1, 0.36, 1) both;',
+      '  animation-timing-function: ease-out, linear(0, 0.42 14%, 0.86 32%, 1.035 54%, 0.994 78%, 1); }',
+      '#ltv-playback-options[data-closing="1"] { animation: none; opacity: 0;',
+      '  transform: translateX(-50%) translateY(16px) scale(0.96);',
+      '  transition: opacity 170ms cubic-bezier(0.4, 0, 1, 1), transform 170ms cubic-bezier(0.4, 0, 1, 1);',
+      '  pointer-events: none !important; }',
+      '#ltv-playback-options header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 8px;',
+      '  padding-bottom: 6px; border-bottom: 1px solid rgba(148,185,255,0.12); }',
+      '#ltv-playback-options h2, #ltv-playback-options h3 { color: inherit; margin: 0; font-weight: 600; }',
+      '#ltv-playback-options h2 { font-size: 17px; letter-spacing: 0.2px; }',
+      '#ltv-playback-options h3 { font-size: 13px; color: #9db2d1; margin: 12px 0 6px; }',
+      '#ltv-playback-options .ltv-options-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding-right: 2px; }',
+      '#ltv-playback-options .ltv-ep-ranges { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto;',
+      '  scroll-snap-type: x proximity; -webkit-overflow-scrolling: touch; padding-bottom: 6px; margin-bottom: 6px; scrollbar-width: none; }',
+      '#ltv-playback-options .ltv-ep-ranges::-webkit-scrollbar { display: none; }',
+      '#ltv-playback-options .ltv-ep-ranges button { flex: 0 0 auto; scroll-snap-align: start; min-height: 32px;',
+      '  padding: 4px 10px; font-size: 12px; border-radius: 999px; font-variant-numeric: tabular-nums; }',
+      '#ltv-playback-options .ltv-option-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(64px,1fr)); gap: 7px; }',
+      '#ltv-playback-options .ltv-playback-actions { flex: 0 0 auto; margin-top: 8px; margin-bottom: 6px; grid-template-columns: repeat(auto-fit,minmax(100px,1fr)); }',
+      '#ltv-playback-options .ltv-episode-grid { grid-template-columns: repeat(auto-fill,minmax(84px,1fr)); }',
+      '#ltv-playback-options button { font: inherit; border: 1px solid rgba(148,185,255,0.16); border-radius: 10px;',
+      '  padding: 6px 8px; background: rgba(29,41,62,0.84); color: inherit; min-height: 44px;',
+      '  transition: transform 0.14s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease; }',
+      '#ltv-playback-options .ltv-episode-grid button { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+      '#ltv-playback-options button[aria-pressed="true"] {',
+      '  background: linear-gradient(135deg, #00b8e6 0%, #2563eb 100%) !important;',
+      '  border-color: rgba(125,211,252,0.65) !important; color: #ffffff !important; font-weight: 600;',
+      '  box-shadow: 0 0 0 1px rgba(125,211,252,0.35), 0 6px 18px -4px rgba(0,184,230,0.45); }',
+      '#ltv-playback-options button:focus-visible { outline: 2px solid #7dd3fc; outline-offset: -2px; }',
+      'html.ltv-pip #ltv-ui, html.ltv-pip #ltv-cast, html.ltv-pip .art-bottom,',
+      'html.ltv-pip .art-mask, html.ltv-pip .art-settings { visibility: hidden !important; }',
+      /* 投屏用翡翠极光渐变：和「退出」区分开，也提示它是一个动作而不是返回 */
+      '#ltv-cast-btn { position: relative; background: linear-gradient(135deg, rgba(16,185,129,0.92), rgba(5,150,105,0.92)) !important; border-color: rgba(167,243,208,0.34) !important; }',
+      /* 投屏中：文字换成「投屏中」，带有合成器脉冲光环，暗示点进去是管理而不是重新搜设备 */
+      '#ltv-cast-btn[data-casting="1"] { background: linear-gradient(135deg, rgba(5,150,105,0.95), rgba(4,120,87,0.95)) !important; border-color: rgba(110,231,183,0.58) !important; }',
+      '#ltv-cast-btn[data-casting="1"]::after {',
+      '  content: ""; position: absolute; inset: -3px; border-radius: 999px;',
+      '  border: 2px solid rgba(52,211,153,0.72); pointer-events: none; opacity: 0;',
+      '}',
+      '@media (prefers-reduced-motion: no-preference) {',
+      '  #ltv-cast-btn[data-casting="1"]::after { animation: ltvCastRadar 2.2s cubic-bezier(0.22, 1, 0.36, 1) infinite; }',
+      '}',
       /* --- 投屏面板：与投屏按钮同一层（网页 DOM），不依赖原生覆盖层 ---
          层级与 #ltv-ui 相同、但插入在它之后：同 z-index 时「后出现者在上」，
          面板打开后蒙层正好盖住左上那两颗按钮，不会出现「点蒙层点到了退出全屏」。 */
       '#ltv-cast { position: fixed !important; inset: 0 !important;',
       '  z-index: 2147483647 !important; display: none; align-items: center; justify-content: center;',
-      '  background: rgba(0,0,0,0.58) !important; pointer-events: auto !important;',
+      '  background: rgba(5,9,17,0.66) !important; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);',
+      '  pointer-events: auto !important; transition: opacity 170ms ease-out;',
       '  font: 14px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif !important; }',
-      '#ltv-cast-card { width: min(86vw, 420px) !important; max-height: 76vh !important;',
-      '  box-sizing: border-box; padding: 16px 16px 14px !important; border-radius: 16px !important;',
-      '  background: #171c22 !important; color: #fff !important;',
-      '  box-shadow: 0 12px 40px rgba(0,0,0,.6); display: flex; flex-direction: column; gap: 10px; }',
-      '#ltv-cast-head { display: flex; align-items: center; justify-content: space-between; }',
-      '#ltv-cast-title { font-size: 16px !important; font-weight: 600 !important; }',
-      '#ltv-cast-close { width: 30px; height: 30px; line-height: 30px; text-align: center;',
-      '  border-radius: 15px; background: rgba(255,255,255,.08); color: #cfd6df;',
-      '  font-size: 14px; cursor: pointer; }',
-      '#ltv-cast-status { font-size: 12px !important; color: #9aa6b4 !important; min-height: 17px;',
+      '#ltv-cast[data-closing="1"] { opacity: 0; pointer-events: none !important; }',
+      '#ltv-cast-card { width: min(88vw, 420px) !important; max-height: calc(100vh - 24px) !important; max-height: calc(100dvh - 24px) !important;',
+      '  overflow-y: auto !important; contain: layout style paint; box-sizing: border-box; padding: 16px 16px 14px !important; border-radius: 18px !important;',
+      '  border: 1px solid rgba(148,185,255,0.22) !important; background: rgba(14,21,34,0.92) !important; color: #eef5ff !important;',
+      '  backdrop-filter: blur(26px) saturate(175%); -webkit-backdrop-filter: blur(26px) saturate(175%);',
+      '  box-shadow: 0 24px 64px rgba(0,0,0,0.72), inset 0 1px 0 rgba(255,255,255,0.12); display: flex; flex-direction: column; gap: 10px;',
+      '  animation: ltvCardOpacity 180ms ease-out both, ltvCardTransform 260ms cubic-bezier(0.22, 1, 0.36, 1) both;',
+      '  animation-timing-function: ease-out, linear(0, 0.42 14%, 0.86 32%, 1.035 54%, 0.994 78%, 1); }',
+      '#ltv-cast[data-closing="1"] #ltv-cast-card { animation: none; opacity: 0; transform: translateY(14px) scale(0.96);',
+      '  transition: opacity 170ms cubic-bezier(0.4, 0, 1, 1), transform 170ms cubic-bezier(0.4, 0, 1, 1); }',
+      '#ltv-cast-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;',
+      '  padding-bottom: 6px; border-bottom: 1px solid rgba(148,185,255,0.12); }',
+      '#ltv-cast-title { font-size: 16px !important; font-weight: 600 !important; letter-spacing: 0.2px; }',
+      '#ltv-cast-close { width: 38px; height: 38px; line-height: 38px; text-align: center;',
+      '  border-radius: 19px; background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,0.12);',
+      '  color: #dbe6f5; font-size: 15px; cursor: pointer; transition: transform 0.15s ease, background-color 0.15s ease; }',
+      '#ltv-cast-close:active { transform: scale(0.92); background: rgba(255,255,255,0.18); }',
+      '#ltv-cast-status { flex: 0 0 auto; font-size: 12px !important; color: #9db2d1 !important; min-height: 17px;',
       '  word-break: break-word; }',
-      '#ltv-cast-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto;',
+      '#ltv-cast-list { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; overflow-y: auto;',
       '  max-height: 44vh; }',
-      '.ltv-cast-item { padding: 12px 14px !important; border-radius: 10px !important;',
-      '  background: #232b34 !important; color: #fff !important; font-size: 14px !important;',
-      '  cursor: pointer; }',
-      '.ltv-cast-item:active { background: #2c3742 !important; }',
-      '#ltv-cast-actions { display: flex; flex-wrap: wrap; gap: 8px; }',
+      '.ltv-cast-item { padding: 12px 14px !important; border-radius: 12px !important;',
+      '  background: rgba(29,41,62,0.85) !important; border: 1px solid rgba(148,185,255,0.16) !important;',
+      '  color: #eef5ff !important; font-size: 14px !important; cursor: pointer;',
+      '  transition: transform 0.15s ease, border-color 0.18s ease, background-color 0.18s ease; }',
+      '.ltv-cast-item:active { background: rgba(38,56,84,0.95) !important; border-color: rgba(16,185,129,0.6) !important; transform: scale(0.98); }',
+      '#ltv-cast-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; }',
       '.ltv-cast-btn2 { flex: 1 1 40%; min-width: 104px; padding: 11px 12px !important;',
-      '  border-radius: 10px !important; background: #2b333d !important; color: #e8eef5 !important;',
-      '  text-align: center; font-size: 13px !important; cursor: pointer; }',
-      '.ltv-cast-btn2.primary { background: #2fa36b !important; color: #fff !important; }',
+      '  border-radius: 12px !important; background: rgba(34,47,70,0.88) !important;',
+      '  border: 1px solid rgba(148,185,255,0.15) !important; color: #e8f1ff !important;',
+      '  text-align: center; font-size: 13px !important; cursor: pointer;',
+      '  transition: transform 0.15s ease, filter 0.18s ease; }',
+      '.ltv-cast-btn2.primary { background: linear-gradient(135deg, #10b981, #059669) !important; border-color: rgba(167,243,208,0.3) !important; color: #fff !important; font-weight: 600; }',
       /* 停止投屏用红色：与「关闭 / 切换」拉开，误触代价最高的一颗不能长得像普通按钮 */
-      '.ltv-cast-btn2.danger { background: #c2453f !important; color: #fff !important; }',
+      '.ltv-cast-btn2.danger { background: linear-gradient(135deg, #ef4444, #dc2626) !important; border-color: rgba(254,202,202,0.3) !important; color: #fff !important; font-weight: 600; }',
       /* --- 投屏遥控器：进度条 + 快退 / 暂停继续 / 快进 --- */
-      '#ltv-cast-controls { display: flex; flex-direction: column; gap: 10px; }',
+      '#ltv-cast-controls { flex: 0 0 auto; display: flex; flex-direction: column; gap: 10px;',
+      '  padding: 10px; border-radius: 12px; background: rgba(9,14,24,0.52); border: 1px solid rgba(148,185,255,0.12); }',
       /* 非 casting 态时这块是空的，:empty 把 flex gap 也一并去掉 */
       '#ltv-cast-controls:empty { display: none; }',
       '#ltv-cast-timeline { display: flex; align-items: center; gap: 8px; }',
       /* input[type=range] 必须清掉原生外观，否则安卓 WebView 画成一条细线、拇指点不到 */
-      '#ltv-cast-range { -webkit-appearance: none; appearance: none; flex: 1 1 auto;',
-      '  height: 26px; margin: 0; background: transparent; pointer-events: auto; }',
-      '#ltv-cast-range::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;',
-      '  background: rgba(255,255,255,.22); }',
-      '#ltv-cast-range::-webkit-slider-thumb { -webkit-appearance: none; width: 15px; height: 15px;',
-      '  margin-top: -5.5px; border-radius: 8px; background: #2fa36b;',
-      '  box-shadow: 0 0 0 3px rgba(47,163,107,.22); }',
-      '#ltv-cast-time { font-size: 11px !important; color: #9aa6b4 !important;',
+      '#ltv-cast-range {',
+      '  --slider-track-size: 6px; --slider-thumb-size: 18px; --slider-progress: 0%;',
+      '  -webkit-appearance: none; appearance: none; flex: 1 1 auto;',
+      '  height: 34px; margin: 0; padding: 0; border: 0; background: transparent;',
+      '  cursor: pointer; pointer-events: auto;',
+      '}',
+      '#ltv-cast-range:focus-visible { outline: 2px solid #34d399; outline-offset: 4px; border-radius: 6px; }',
+      '#ltv-cast-range::-webkit-slider-runnable-track { height: var(--slider-track-size); border: 0; border-radius: 999px;',
+      '  background: linear-gradient(90deg, #10b981 0%, #00c8f8 var(--slider-progress), rgba(255,255,255,0.18) var(--slider-progress)); }',
+      '#ltv-cast-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none;',
+      '  width: var(--slider-thumb-size); height: var(--slider-thumb-size);',
+      '  margin-block-start: calc((var(--slider-track-size) - var(--slider-thumb-size)) / 2);',
+      '  border-radius: 50%; background: #ffffff; border: 2px solid #10b981;',
+      '  box-shadow: 0 0 0 4px rgba(16,185,129,0.28), 0 2px 8px rgba(0,0,0,0.45);',
+      '  transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1); }',
+      '#ltv-cast-range:active::-webkit-slider-thumb { transform: scale(1.18); }',
+      '#ltv-cast-range::-moz-range-track { height: var(--slider-track-size); border: 0; border-radius: 999px; background: rgba(255,255,255,0.18); }',
+      '#ltv-cast-range::-moz-range-progress { height: var(--slider-track-size); border-radius: 999px; background: linear-gradient(90deg, #10b981, #00c8f8); }',
+      '#ltv-cast-range::-moz-range-thumb { width: var(--slider-thumb-size); height: var(--slider-thumb-size); border: 2px solid #10b981; border-radius: 50%; background: #ffffff; }',
+      '#ltv-cast-time { font-size: 11px !important; color: #9db2d1 !important;',
       '  white-space: nowrap; font-variant-numeric: tabular-nums; }',
       '#ltv-cast-ctrl { display: flex; align-items: center; justify-content: center; gap: 14px; }',
-      '.ltv-cast-round { min-width: 62px; height: 40px; line-height: 40px; text-align: center;',
-      '  border-radius: 20px; background: #232b34 !important; color: #e8eef5 !important;',
-      '  font-size: 13px !important; cursor: pointer;',
+      '.ltv-cast-round { min-width: 64px; height: 42px; line-height: 42px; text-align: center;',
+      '  border-radius: 21px; background: rgba(34,47,70,0.92) !important; border: 1px solid rgba(148,185,255,0.18) !important;',
+      '  color: #e8f1ff !important; font-size: 13px !important; cursor: pointer;',
+      '  transition: transform 0.14s ease, filter 0.15s ease;',
       '  -webkit-user-select: none; user-select: none; }',
-      '.ltv-cast-round.big { min-width: 72px; height: 48px; line-height: 48px; border-radius: 24px;',
-      '  background: #2fa36b !important; color: #fff !important; font-size: 17px !important; }',
-      '.ltv-cast-round:active { filter: brightness(1.2); }',
+      '.ltv-cast-round.big { min-width: 76px; height: 50px; line-height: 50px; border-radius: 25px;',
+      '  background: linear-gradient(135deg, #10b981, #059669) !important; border-color: rgba(167,243,208,0.35) !important;',
+      '  color: #fff !important; font-size: 17px !important; box-shadow: 0 8px 20px -4px rgba(16,185,129,0.5); }',
+      '.ltv-cast-round:active { transform: scale(0.93); filter: brightness(1.16); }',
       /* ================= 方向规则（必须在最后，靠「后出现者胜」压住上面所有基础规则） ================= */
       '@media (orientation: portrait) {',
       '  html video, html .art-video video { object-fit: contain !important; }',
@@ -770,7 +1205,17 @@
       '  html .art-control-screenshot { display: none !important; }',
       '  html .art-bottom { padding-left: 6px !important; padding-right: 6px !important; }',
       '  html .art-control-time { font-size: 11px !important; }',
-      '  html .art-control-progress { min-height: 30px !important; }',
+      '  html .art-control-progress { min-height: 28px !important; }',
+      '}',
+      '@media (prefers-reduced-motion: reduce) {',
+      '  #ltv-playback-options, #ltv-cast-card, #ltv-cast-btn[data-casting="1"]::after,',
+      '  .ltv-playback-backdrop { animation: none !important; }',
+      '  #ltv-playback-options[data-closing="1"], .ltv-playback-backdrop[data-closing="1"],',
+      '  #ltv-cast[data-closing="1"], #ltv-cast[data-closing="1"] #ltv-cast-card { transition: none !important; }',
+      '  #ltv-exit-btn:active, #ltv-cast-btn:active, #ltv-playback-btn:active,',
+      '  #ltv-playback-options button:active, .ltv-cast-btn2:active,',
+      '  .ltv-cast-round:active, #ltv-cast-close:active, .ltv-cast-item:active,',
+      '  .art-control-progress:active .art-progress-indicator, #ltv-cast-range:active::-webkit-slider-thumb { transform: none !important; }',
       '}',
       '@media (orientation: landscape) {',
       '  html[data-ltv-fit="cover"] video,',
@@ -791,7 +1236,7 @@
     var fn = bridge('onProgress');
     if (!v || !fn) return;
     var now = Date.now();
-    if (!force && now - lastReport < 450) return;
+    if (!force && now - lastReport < 250) return;
     lastReport = now;
     try {
       fn(isFinite(v.currentTime) ? v.currentTime : 0,
@@ -803,6 +1248,18 @@
     var v = vid();
     if (!v || v.__ltvBound) return;
     v.__ltvBound = true;
+    function restoreRate() {
+      if (tempRateActive) return;
+      try {
+        var rate = Number(localStorage.getItem('ltv-playback-rate'));
+        if (speeds.indexOf(rate) !== -1) {
+          v.defaultPlaybackRate = rate;
+          v.playbackRate = rate;
+        }
+      } catch (e) { }
+    }
+    restoreRate();
+    v.addEventListener('loadedmetadata', restoreRate);
     var handler = function () { reportProgress(false); };
     ['timeupdate', 'durationchange', 'loadedmetadata', 'play', 'seeked', 'pause']
       .forEach(function (ev) { try { v.addEventListener(ev, handler); } catch (e) { } });
@@ -817,6 +1274,7 @@
     var has = !!v;
     if (has !== lastVideo) {
       lastVideo = has;
+      if (!has) tempRateActive = false;
       var fn = bridge('onVideo');
       if (fn) { try { fn(has); } catch (e) { } }
     }
@@ -834,8 +1292,14 @@
       lastState = on;
       notify(on);
       try {
-        if (on) document.documentElement.classList.add('ltv-fs');
-        else document.documentElement.classList.remove('ltv-fs');
+        if (on) {
+          document.documentElement.classList.add('ltv-fs');
+          wakeHud();
+        } else {
+          document.documentElement.classList.remove('ltv-fs');
+          if (hudIdleTimer) { clearTimeout(hudIdleTimer); hudIdleTimer = null; }
+          document.documentElement.removeAttribute('data-ltv-hud');
+        }
       } catch (e) { }
       /* 把网页侧判断写进日志中心：下次若还有人「全屏里什么都没有」，
          这一行会直接说明是网页没判定成全屏，还是原生层没收到。 */
@@ -858,6 +1322,12 @@
 
   // ---------------------------------------------------------------- 全屏接管
   document.addEventListener('click', function (e) {
+    var webToggle = upClass(e.target, 'art-control-fullscreenWeb');
+    if (webToggle) {
+      try { requestAnimationFrame(check); } catch (err) { }
+      setTimeout(check, 40);
+      return;
+    }
     var btn = upClass(e.target, 'art-control-fullscreen');
     if (!btn) return;
     if (nativeFullscreen() || q('.art-fullscreen')) return;
@@ -867,8 +1337,15 @@
     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
     if (e.stopPropagation) e.stopPropagation();
     webBtn.click();
-    setTimeout(check, 60);
+    try { requestAnimationFrame(check); } catch (err) { }
+    setTimeout(check, 40);
   }, true);
+
+  document.addEventListener('pointerdown', function (e) {
+    if (isFullscreen() && (e.target.closest && (e.target.closest('#ltv-top-actions') || e.target.closest('.art-bottom')))) {
+      wakeHud();
+    }
+  }, { capture: true, passive: true });
 
   function onFullscreenChange() {
     if (nativeFullscreen()) {
@@ -887,13 +1364,46 @@
 
   // ---------------------------------------------------------------- 原生控制 API
   window.__ltv = {
+    closePlaybackOptions: function () { closePlaybackOptions(false); },
+    wakeHud: wakeHud,
+    setTempRate: function (active) {
+      var v = vid();
+      if (active) {
+        if (!tempRateActive) {
+          var saved = NaN;
+          try { saved = Number(localStorage.getItem('ltv-playback-rate')); } catch (e) { }
+          tempRateSaved = speeds.indexOf(saved) !== -1 ? saved : (v && isFinite(v.playbackRate) ? v.playbackRate : 1);
+          tempRateActive = true;
+        }
+        if (v) v.playbackRate = 2;
+        return '2';
+      }
+      var backRate = tempRateSaved;
+      try {
+        var stored = Number(localStorage.getItem('ltv-playback-rate'));
+        if (speeds.indexOf(stored) !== -1) backRate = stored;
+      } catch (e) { }
+      if (!(backRate > 0)) backRate = 1;
+      tempRateActive = false;
+      if (v) {
+        v.defaultPlaybackRate = backRate;
+        v.playbackRate = backRate;
+      }
+      return String(backRate);
+    },
+    setPip: function (active) {
+      document.documentElement.classList.toggle('ltv-pip', !!active);
+      if (active) closePlaybackOptions(true);
+    },
     /** 一键进入全屏：优先用 ArtPlayer 网页全屏，失败则客户端 CSS 铺满 */
     enter: function () {
-      if (isFullscreen()) { setTimeout(check, 30); return 'already'; }
+      if (isFullscreen()) { check(); try { requestAnimationFrame(check); } catch (e) { } return 'already'; }
       var webBtn = q('.art-control-fullscreenWeb');
       if (webBtn) {
         try { webBtn.click(); } catch (e) { }
-        setTimeout(check, 100);
+        check();
+        try { requestAnimationFrame(check); } catch (e) { }
+        setTimeout(check, 120);
         setTimeout(check, 400);
         return 'web';
       }
@@ -902,7 +1412,8 @@
         document.documentElement.classList.add('ltv-fs');
       } catch (e) { }
       notify(true);
-      setTimeout(check, 50);
+      check();
+      try { requestAnimationFrame(check); } catch (e) { }
       return 'manual';
     },
     exit: function () {
@@ -927,6 +1438,8 @@
       if (q('.art-fullscreen') && nativeBtn && !q('.art-fullscreen-web')) {
         try { nativeBtn.click(); } catch (e) { }
       }
+      check();
+      try { requestAnimationFrame(check); } catch (e) { }
       setTimeout(check, 120);
       setTimeout(check, 450);
       return 'ok';
@@ -959,18 +1472,64 @@
       if (v.paused) {
         var p = v.play();
         if (p && p.catch) p.catch(function () { });
+        wakeHud();
         return 'playing';
       }
       v.pause();
+      wakeHud();
       return 'paused';
     },
     /** 仅让 ArtPlayer 自己的控制栏显示一次；不切换任何全屏互斥状态。 */
     showControls: function () {
+      if (controlsHideTimer) { clearTimeout(controlsHideTimer); controlsHideTimer = null; }
+      var player = q('.art-video-player');
+      if (player && player.classList) {
+        player.classList.add('art-control-show');
+        player.classList.remove('art-mini-progress-bar');
+      }
       ['.art-bottom', '.art-controls'].forEach(function (sel) {
         var el = q(sel);
         if (el && el.classList) el.classList.add('art-control-show');
       });
+      wakeHud();
       return 'ok';
+    },
+    /** 轻触画面平滑切换底部控制条与顶栏 HUD；未锁定时 4 秒自动回落为极简状态。 */
+    toggleControls: function () {
+      var player = q('.art-video-player');
+      var shown = !!(player && player.classList.contains('art-control-show')
+        && !player.classList.contains('art-mini-progress-bar'));
+      if (controlsHideTimer) { clearTimeout(controlsHideTimer); controlsHideTimer = null; }
+      if (shown) {
+        if (player && player.classList) {
+          player.classList.remove('art-control-show');
+          player.classList.add('art-mini-progress-bar');
+        }
+        ['.art-bottom', '.art-controls'].forEach(function (sel) {
+          var el = q(sel);
+          if (el && el.classList) el.classList.remove('art-control-show');
+        });
+        wakeHud();
+        return 'hidden';
+      }
+      window.__ltv.showControls();
+      if (!webControlsWanted) {
+        controlsHideTimer = setTimeout(function () {
+          controlsHideTimer = null;
+          if (!webControlsWanted && !playbackPanel && !castPanelOpen) {
+            var p = q('.art-video-player');
+            if (p && p.classList) {
+              p.classList.remove('art-control-show');
+              p.classList.add('art-mini-progress-bar');
+            }
+            ['.art-bottom', '.art-controls'].forEach(function (sel) {
+              var el = q(sel);
+              if (el && el.classList) el.classList.remove('art-control-show');
+            });
+          }
+        }, 4000);
+      }
+      return 'shown';
     },
     /**
      * 兼容旧调用。以前这里会把网页控制栏整体压掉（ltv-native-bar）、由原生层接管，
@@ -994,6 +1553,11 @@
         cl.remove('ltv-native-bar');
         cl.add('ltv-web-controls');
       } catch (e) { }
+      var player = q('.art-video-player');
+      if (player && player.classList) {
+        player.classList.add('art-control-show');
+        player.classList.remove('art-mini-progress-bar');
+      }
       ['.art-bottom', '.art-controls'].forEach(function (sel) {
         var el = q(sel);
         if (el && el.classList) el.classList.add('art-control-show');
@@ -1008,6 +1572,11 @@
         cl.remove('ltv-web-controls');
         cl.remove('ltv-native-bar');
       } catch (e) { }
+      var player = q('.art-video-player');
+      if (player && player.classList) {
+        player.classList.remove('art-control-show');
+        player.classList.add('art-mini-progress-bar');
+      }
       ['.art-bottom', '.art-controls'].forEach(function (sel) {
         var el = q(sel);
         if (el && el.classList) el.classList.remove('art-control-show');
@@ -1127,7 +1696,7 @@
     },
     /** 供原生 / 调试直接下发跳转（秒） */
     castSeek: function (sec) { return castSeekTo(sec) ? 'ok' : 'fail'; },
-    castHide: function () { castHide(); return 'ok'; },
+    castHide: function () { castHide(false); return 'ok'; },
     nextFit: function () {
       var arr = ['contain', 'cover', 'fill'];
       var cur = 'contain';
@@ -1155,41 +1724,52 @@
     /** 投屏用：返回当前可投屏的视频直链（绝对地址），拿不到返回空串。 */
     castUrl: function () {
       var candidates = [];
-      candidates.push(streamUrl);
-      /* ArtPlayer 实例：container.art.url / 静态实例表 */
+      var v = vid();
+      if (!v) return '';
+      var watch = window.__ltvWatch;
+      if (watch && watch.stream) candidates.push(watch.stream);
+      /* 播放页 / 直播页 URL 参数：/watch?...&url=<直链> 或 /live?url=<频道地址> */
+      try {
+        if (/\/(watch|live)\/?$/.test(location.pathname)) {
+          candidates.push(new URLSearchParams(location.search).get('url') || '');
+        }
+      } catch (e) { }
+      /* ArtPlayer 实例（优先匹配当前 <video> 所属实例，但不抢占 watch.stream 与 URL 参数） */
       try {
         var el = q('.artplayer');
         if (el && el.art && el.art.url) candidates.push(el.art.url);
         if (window.Artplayer && window.Artplayer.instances) {
+          var fallbackArt = [];
           for (var i = 0; i < window.Artplayer.instances.length; i++) {
-            if (window.Artplayer.instances[i].url) {
-              candidates.push(window.Artplayer.instances[i].url);
+            var inst = window.Artplayer.instances[i];
+            if (inst && inst.url && (inst.video === v || (inst.template && inst.template.$video === v))) {
+              candidates.push(inst.url);
+            } else if (inst && inst.url) {
+              fallbackArt.push(inst.url);
             }
           }
+          for (var j = 0; j < fallbackArt.length; j++) candidates.push(fallbackArt[j]);
         }
       } catch (e) { }
-      var v = vid();
-      if (v) {
-        candidates.push(v.currentSrc || '');
-        candidates.push(v.src || '');
-      }
-      /* 播放页 URL 参数：/watch?...&url=<直链> */
-      try {
-        candidates.push(new URLSearchParams(location.search).get('url') || '');
-      } catch (e) { }
+      candidates.push(v.currentSrc || '', v.src || '');
+      if (streamPage === location.href) candidates.push(streamUrl);
       for (var k = 0; k < candidates.length; k++) {
         var u = candidates[k];
         if (!u) continue;
         u = String(u);
         if (u.indexOf('blob:') === 0 || u.indexOf('data:') === 0) continue;
-        try { return new URL(u, location.href).href; } catch (e2) { return u; }
+        try {
+          var direct = castStreamUrl(u);
+          if (direct) return direct;
+        } catch (e2) { }
       }
       return '';
     },
     /** 投屏用：影片标题，用于电视上显示的 DIDL-Lite dc:title。 */
     castTitle: function () {
       try {
-        var t = new URLSearchParams(location.search).get('title');
+        var params = new URLSearchParams(location.search);
+        var t = params.get('title') || params.get('name');
         if (t) return t;
       } catch (e) { }
       var h = q('h1');

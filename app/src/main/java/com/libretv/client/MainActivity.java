@@ -84,6 +84,9 @@ import java.util.Locale;
 public class MainActivity extends Activity implements LocalServer.Callback {
 
     private static final String PREF = "libretv_client";
+    private static final String KEY_ONLINE_SOURCE_URL = "online_source_url";
+    private static final String KEY_ONLINE_SOURCE_FETCHED_AT = "online_source_fetched_at";
+    private static final long ONLINE_SOURCE_REFRESH_MS = 24L * 60 * 60 * 1000;
     private static final String KEY_URL = "server_url";
     /** 旧版「全局已导入」标记：跨 origin 会误跳过注入，仅保留用于清除遗留值 */
     private static final String KEY_PRESET_IMPORTED_LEGACY = "preset_imported";
@@ -120,7 +123,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     /** 手机本机自带服务（默认） */
     private static final String DEFAULT_URL = "http://127.0.0.1:8899";
     /** 回退：电脑上已搭好的 LibreTV 服务 */
-    private static final String DEFAULT_EXTERNAL_URL = "http://192.168.1.100:8899";
+    private static final String DEFAULT_EXTERNAL_URL = "";
     private static final String DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -128,12 +131,15 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private static final int REQ_IMPORT_FILE = 1002;
     private static final int REQ_EXPORT_FILE = 1003;
 
-    private static final int BG = 0xFF0F1115;
-    private static final int SURFACE = 0xFF1B1F27;
-    private static final int SURFACE2 = 0xFF252B36;
-    private static final int ACCENT = 0xFF4C8BF5;
-    private static final int TEXT = 0xFFF2F4F8;
-    private static final int TEXT_DIM = 0xFF98A2B3;
+    private static final int BG = 0xFF0B101A;
+    private static final int SURFACE = 0xFF131C2B;
+    private static final int SURFACE2 = 0xFF1D2A3F;
+    private static final int ACCENT = 0xFF00B8E6;
+    private static final int ACCENT_BLUE = 0xFF2563EB;
+    private static final int BORDER_GLOW = 0x2E7DD3FC;
+    private static final int LINE_SOFT = 0x22FFFFFF;
+    private static final int TEXT = 0xFFEEF5FF;
+    private static final int TEXT_DIM = 0xFF94A8C4;
     private static final int DANGER = 0xFFFF7B7B;
 
     /**
@@ -152,8 +158,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     + "'button,a,[role=button]{touch-action:manipulation}',"
                     + "'video{max-width:100%!important}',"
                     + "'@media (orientation:portrait){',"
-                    + "'main.max-w-7xl{padding-left:0!important;padding-right:0!important}',"
-                    + "'.aspect-video{border-radius:0!important;margin-left:0!important;margin-right:0!important}',"
+                    + "'main.max-w-7xl{padding-left:12px!important;padding-right:12px!important}',"
+                    + "'main.max-w-7xl .aspect-video:has(.artplayer),main.max-w-7xl .aspect-video:has(video){border-radius:0!important;margin-left:-12px!important;margin-right:-12px!important;width:calc(100% + 24px)!important;max-width:none!important}',"
                     + "'header.sticky{max-width:100%!important}',"
                     + "'}'"
                     + "].join('');"
@@ -162,11 +168,28 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private SharedPreferences prefs;
     private FrameLayout root;
     private LinearLayout mainBox;
+    private View bottomDivider;
+    private FrameLayout bottomBarHost;
+    private View navActivePill;
     private LinearLayout bottomBar;
+    private ImageView navHomeIcon;
+    private TextView navHomeText;
+    private ImageView navLiveIcon;
+    private TextView navLiveText;
+    private LinearLayout watchActions;
+    private TextView watchStatusText;
+    private boolean imeOpen = false;
+    private String lastNavRoute = "";
+    private ScrollView settingsScroll;
+    private LinearLayout[] settingsSections;
+    private Button[] settingsTabs;
     private WebView web;
     private ProgressBar progress;
     private View scrim;
     private View sheetHost;
+    private boolean sheetShowing = false;
+    private int currentSettingsTab = 0;
+    private boolean overlayShowing = false;
     private TextView fabRestore;
     private EditText settingsEdit;
     private CheckBox desktopBox;
@@ -181,11 +204,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private LinearLayout playbackBar;
     private SeekBar playbackSeek;
     private TextView playbackTime;
-    private TextView fabFullscreen;
     private boolean hasVideo = false;
     private boolean seekDragging = false;
     private boolean fsFallbackCancelled = false;
     private final Handler controlHandler = new Handler(Looper.getMainLooper());
+    private final Handler watchdogHandler = new Handler(Looper.getMainLooper());
+    private Thread watchdogThread;
     private Runnable controlHideTask;
     private float touchDownX, touchDownY;
     /** true = 用户主动切到网页控制栏（倍速 / 清晰度），此时轻触画面不唤出原生条，避免打断操作 */
@@ -200,11 +224,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     // ------------------------------------------------ DLNA 投屏
     private DlnaCast cast;
     private boolean castPanelOpen = false;
+    private boolean playbackPanelOpen = false;
+    private boolean picturePending = false;
     /** 最近一次发起 SSDP 搜索的时间：用于忽略 800ms 内的重复触发 */
     private long castDiscoverAt = 0;
-    private TextView fabCast;
+    private Button castAction;
     private DlnaCast.Device castDevice;
-    private String lastStreamUrl = "";
     private String castTitleText = "LibreTV 投屏";
     private android.app.AlertDialog castDialog;
     private final List<DlnaCast.Device> castDevices = new ArrayList<DlnaCast.Device>();
@@ -228,6 +253,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
      */
     private boolean domUiActive = false;
     private TextView gestureHint;
+    private float gestureLevel = -1f;
+    private final Paint hudBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hudTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint hudFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint lineGlowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final android.graphics.RectF hudRect = new android.graphics.RectF();
     private TextView panelToggle;
     private boolean immersiveLayersOn = false;
     private boolean advancedPanelVisible = false;
@@ -244,6 +275,14 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private double gStartSec, gPreviewSec;
     private float gStartBrightness;
     private int gStartVolume, gMaxVolume;
+    private float gVolumeFloat = 0f;
+    private Runnable singleTapTask;
+    private Runnable longPressRateTask;
+    private boolean tempSpeedBoosting = false;
+    private long lastTapUpMs = 0;
+    private float lastTapUpX = 0f, lastTapUpY = 0f;
+    private boolean playbackBarTargetVisible = false;
+    private int lastWatchBarSec = -1;
 
     // 日志中心：底部导航直达，常驻可见、自动刷新、一键分享
     private android.app.AlertDialog logDialog;
@@ -258,6 +297,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private LinearLayout overlay;
     private TextView overlayTitle;
     private TextView overlayHint;
+    private ProgressBar overlayProgress;
     private EditText overlayEdit;
     private Button overlayPrimary;
     private Button overlaySecondary;
@@ -282,12 +322,17 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private String pendingExportName = "";
     private boolean importReplaceMode = false;
     private String playerTouchJs = "";
+    private String uiFxJs = "";
     /** 服务端 /api/status.defaultSources 条数；-1=尚未探测，>0 时不必再往 localStorage 注入 */
     private volatile int serverEnvSourceCount = -1;
     private volatile String probedUrl = "";
+    private volatile String readyPageUrl = "";
     private int presetCount = 0;
     private int presetLiveCount = 0;
     private boolean injecting = false;
+    private boolean pendingLocalReload = false;
+    private boolean hasPaused = false;
+    private long pausedAtMs = 0;
     private boolean immersive = false;
     private boolean playbackMode = false;
     private int brightnessStep = 0;
@@ -308,7 +353,21 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private volatile int heartbeatProgress = 100;
     private volatile String heartbeatMode = "";
 
-    private LocalServer localServer;
+    private LocalServerService serverService;
+    private boolean serverBound;
+    private boolean refreshingOnlineSources;
+    private String bridgeToken;
+    private final android.content.ServiceConnection serverConnection = new android.content.ServiceConnection() {
+        @Override public void onServiceConnected(android.content.ComponentName name, android.os.IBinder binder) {
+            serverService = ((LocalServerService.ServerBinder) binder).getService();
+            serverService.attach(MainActivity.this);
+        }
+
+        @Override public void onServiceDisconnected(android.content.ComponentName name) {
+            serverService = null;
+            updateServerStat();
+        }
+    };
     private boolean localMode = true;
     private boolean lanMode = false;
     private int localPort = DEFAULT_PORT;
@@ -329,10 +388,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         localPort = prefs.getInt(KEY_PORT, DEFAULT_PORT);
         localPassword = prefs.getString(KEY_PASSWORD, DEFAULT_PASSWORD);
         effectivePassword = resolvePassword();
-        localServer = new LocalServer(this, this);
         cast = new DlnaCast(this);
         loadPreset();
         playerTouchJs = readAsset("player-touch.js");
+        uiFxJs = readAsset("ui-fx.js");
         buildUi();
         configureWeb();
         applyUserAgent();
@@ -350,9 +409,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             String saved = prefs.getString(KEY_URL, "");
             if (saved.isEmpty()) {
                 showSetup("连接 LibreTV 服务",
-                        "输入电脑或服务器上 LibreTV 的地址，例如 192.168.1.100:8899。\n\n"
-                                + "手机与电脑需在同一 Wi-Fi；服务端要绑定 0.0.0.0，"
-                                + "不能用 127.0.0.1（那只代表电脑自己）。",
+                        "输入外部 LibreTV 的 HTTPS 地址。使用局域网地址时，请确认手机可以访问该服务器。",
                         DEFAULT_EXTERNAL_URL);
             } else {
                 settingsEdit.setText(saved);
@@ -375,7 +432,6 @@ public class MainActivity extends Activity implements LocalServer.Callback {
      * 所有对 WebView 的读取都在主线程完成（WebView 非线程安全），后台只读 volatile 字段。
      */
     private void startMainThreadWatchdog() {
-        final Handler main = new Handler(Looper.getMainLooper());
         Runnable beat = new Runnable() {
             @Override public void run() {
                 mainHeartbeat = System.currentTimeMillis();
@@ -389,10 +445,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                             + (webControlsMode ? "/网页栏" : "")
                             + (advancedPanelVisible ? "/面板" : "");
                 } catch (Exception ignored) { }
-                main.postDelayed(this, 1000);
+                watchdogHandler.postDelayed(this, 1000);
             }
         };
-        main.post(beat);
+        watchdogHandler.post(beat);
 
         Thread t = new Thread(new Runnable() {
             @Override public void run() {
@@ -416,6 +472,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             }
         }, "main-watchdog");
         t.setDaemon(true);
+        watchdogThread = t;
         t.start();
     }
 
@@ -426,6 +483,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void startLocalService() {
+        startLocalService(false);
+    }
+
+    private void startLocalService(boolean restart) {
         String abi = LocalServer.abiProblem();
         if (abi != null) {
             overlayMode = 3;
@@ -439,15 +500,44 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         showCard("手机本地服务",
                 "正在启动手机上的 LibreTV 服务…\n\n"
                         + "首次启动需解压约 42 MB 运行包（约 10~30 秒），之后通常几秒就绪。\n"
-                        + "服务只在手机上运行，不依赖电脑。本版本不含内置源，"
-                        + "就绪后请在「设置 → 源管理」里配置源。",
+                        + "服务在手机上运行，就绪后可直接搜索内置源。",
                 localUrl(), "重试启动", "改用外部服务");
-        localServer.start(localPort, effectivePassword, lanMode);
+        Intent request = LocalServerService.request(this, localPort, effectivePassword, lanMode, restart);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(request);
+            else startService(request);
+            if (!serverBound) serverBound = bindService(request, serverConnection, BIND_AUTO_CREATE);
+            if (Build.VERSION.SDK_INT >= 33
+                    && !prefs.getBoolean("asked_server_notifications", false)) {
+                prefs.edit().putBoolean("asked_server_notifications", true).apply();
+                requestPermissions(new String[] { android.Manifest.permission.POST_NOTIFICATIONS }, 89);
+            }
+        } catch (IllegalStateException | SecurityException e) {
+            onError("无法启动前台服务：" + e.getMessage());
+        }
     }
 
     private void restartLocal() {
-        localServer.stop();
-        startLocalService();
+        pendingLocalReload = true;
+        probedUrl = "";
+        serverEnvSourceCount = -1;
+        startLocalService(true);
+    }
+
+    private LocalServer localServer() {
+        return serverService == null ? null : serverService.server();
+    }
+
+    private void disconnectLocalService() {
+        if (serverService != null) serverService.detach(this);
+        if (serverBound) unbindService(serverConnection);
+        serverBound = false;
+        serverService = null;
+    }
+
+    private void stopLocalService() {
+        disconnectLocalService();
+        stopService(new Intent(this, LocalServerService.class));
     }
 
     /**
@@ -485,14 +575,9 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void switchToExternal() {
-        localMode = false;
-        prefs.edit().putBoolean(KEY_LOCAL_MODE, false).apply();
-        localServer.stop();
-        if (localModeBox != null) localModeBox.setChecked(false);
-        String u = normalize(overlayEdit.getText().toString());
-        if (u == null || u.equals(localUrl())) u = DEFAULT_EXTERNAL_URL;
-        updateServerStat();
-        saveAndLoad(u);
+        showSheet(2);
+        localModeBox.setChecked(false);
+        settingsEdit.requestFocus();
     }
 
     @Override
@@ -502,6 +587,11 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 appLog.i("server", message + " (" + percent + "%)");
                 if (overlayVisible() && (overlayMode == 4)) {
                     overlayHint.setText(message);
+                    if (overlayProgress != null) {
+                        int target = Math.max(4, Math.min(100, percent));
+                        android.animation.ObjectAnimator.ofInt(overlayProgress, "progress", target)
+                                .setDuration(200).start();
+                    }
                 }
                 updateServerStat();
             }
@@ -513,10 +603,19 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 appLog.i("server", "本地服务已就绪 " + url);
+                boolean recovering = overlayVisible() && overlayMode != 4;
+                boolean needsReload = recovering || pendingLocalReload;
+                pendingLocalReload = false;
                 hideOverlay();
-                // KEY_URL 始终记录「外部服务地址」，本地模式不覆盖它
-                settingsEdit.setText(prefs.getString(KEY_URL, DEFAULT_EXTERNAL_URL));
-                load(url);
+                if (web != null && (!url.equals(currentUrl) || !sameWebOrigin(web.getUrl(), url))) {
+                    load(url);
+                } else if (web != null && needsReload) {
+                    probedUrl = "";
+                    probeEnvSources(url);
+                    web.reload();
+                } else if (web != null && probedUrl.isEmpty()) {
+                    probeEnvSources(url);
+                }
                 updateServerStat();
                 toast("手机本地服务已就绪");
             }
@@ -541,7 +640,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private void updateServerStat() {
         if (serverStatLine == null) return;
         String status = localMode
-                ? (localServer != null && localServer.isRunning() ? "运行中" : "未运行")
+                ? (localServer() != null && localServer().isRunning() ? "运行中" : "未运行")
                 : "外部服务";
         String addr = localMode ? localUrl() : currentUrl;
         String ip = LocalServer.lanAddress();
@@ -549,8 +648,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 ? "\n其它设备可访问：http://" + ip + ":" + localPort : "";
         // 把 Node 体检结论直接摆在服务状态里，用户不必导出日志就能看到失败原因
         String probe = "";
-        if (localMode && localServer != null) {
-            String r = localServer.envProbeText();
+        if (localMode && localServer() != null) {
+            String r = localServer().envProbeText();
             int shown = 0;
             for (String line : r.split("\n")) {
                 if (line.startsWith("DNS ") || line.startsWith("HTTPS ")
@@ -566,11 +665,11 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     /** Node 运行环境体检：DNS / CA / 真实出站错误码，一屏可直接复制发回。 */
     private void showEnvProbe() {
         hideSheet();
-        final String report = (localServer == null)
+        final String report = (localServer() == null)
                 ? "（本地服务未启动）\n\n本体检只对「手机本地服务」有效；连接电脑服务时请在电脑端排查。"
-                : localServer.envProbeText();
+                : localServer().envProbeText();
         appLog.i("probe", "查看 Node 运行环境体检：\n" + report);
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("Node 运行环境体检")
                 .setMessage(report)
                 .setPositiveButton("关闭", null)
@@ -584,18 +683,18 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                         chooseExportTarget(report, "libretv-env-probe-" + fileStamp() + ".txt", "体检报告");
                     }
                 })
-                .show();
+                .show());
     }
 
     private void showLog() {
-        String s = localServer == null ? "" : localServer.logTail();
+        String s = localServer() == null ? "" : localServer().logTail();
         if (s.trim().isEmpty()) s = "（暂无日志，本地服务可能尚未启动）";
         if (s.length() > 6000) s = s.substring(s.length() - 6000);
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("本地服务日志")
                 .setMessage(s)
                 .setPositiveButton("关闭", null)
-                .show();
+                .show());
     }
 
     private int dp(int v) {
@@ -609,12 +708,93 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         return d;
     }
 
+    private GradientDrawable roundStroke(int fillColor, int radiusDp, int strokeColor) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(fillColor);
+        d.setCornerRadius(dp(radiusDp));
+        d.setStroke(dp(1), strokeColor);
+        return d;
+    }
+
+    private android.graphics.drawable.Drawable rippleRound(int color, int radiusDp) {
+        GradientDrawable bg = roundStroke(color, radiusDp, BORDER_GLOW);
+        if (Build.VERSION.SDK_INT >= 21) {
+            return new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(0x337DD3FC), bg, null);
+        }
+        return bg;
+    }
+
+    private android.graphics.drawable.Drawable gradientRippleRound(int startColor, int endColor, int radiusDp) {
+        GradientDrawable bg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[] { startColor, endColor });
+        bg.setCornerRadius(dp(radiusDp));
+        bg.setStroke(dp(1), 0x40FFFFFF);
+        if (Build.VERSION.SDK_INT >= 21) {
+            return new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(0x40FFFFFF), bg, null);
+        }
+        return bg;
+    }
+
+    private android.graphics.drawable.Drawable rippleMask(int radiusDp) {
+        if (Build.VERSION.SDK_INT >= 21) {
+            return new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(0x2E7DD3FC), null, round(Color.WHITE, radiusDp));
+        }
+        return null;
+    }
+
+    private void attachSpringTouch(final View target) {
+        if (target == null) return;
+        target.setOnTouchListener(new View.OnTouchListener() {
+            @Override public boolean onTouch(View v, MotionEvent event) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    v.animate().cancel();
+                    v.animate().scaleX(0.94f).scaleY(0.94f).setDuration(85)
+                            .setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    v.animate().cancel();
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(200)
+                            .setInterpolator(new android.view.animation.OvershootInterpolator(1.6f)).start();
+                }
+                return false;
+            }
+        });
+    }
+
+    private android.app.AlertDialog styleDarkDialog(android.app.AlertDialog d) {
+        if (d == null) return null;
+        try {
+            android.view.Window w = d.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(roundStroke(0xF5111A2B, 20, BORDER_GLOW));
+            }
+            int[] btnIds = new int[] {
+                    DialogInterface.BUTTON_POSITIVE,
+                    DialogInterface.BUTTON_NEGATIVE,
+                    DialogInterface.BUTTON_NEUTRAL
+            };
+            int[] btnColors = new int[] { ACCENT, TEXT_DIM, TEXT };
+            for (int i = 0; i < btnIds.length; i++) {
+                Button b = d.getButton(btnIds[i]);
+                if (b != null) {
+                    b.setTextColor(btnColors[i]);
+                    b.setAllCaps(false);
+                }
+            }
+        } catch (Exception ignored) { }
+        return d;
+    }
+
     // ---------------------------------------------------------------- 源导入 / 导出
 
     private void showSourceMenu() {
         final CharSequence[] items = {"导出当前源配置", "导入（合并到现有源）",
                 "导入（替换现有源）", "取消"};
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("源管理")
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) {
@@ -622,7 +802,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                         else if (which == 1) showImportPicker(false);
                         else if (which == 2) showImportPicker(true);
                     }
-                }).show();
+                }).show());
     }
 
     /** evaluateJavascript 返回的是 JSON 字符串字面量，解成 Java 字符串。 */
@@ -678,7 +858,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
     private void showImportPicker(final boolean replace) {
         final CharSequence[] items = {"从文件导入", "从剪贴板导入", "从订阅地址导入", "取消"};
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle(replace ? "导入并替换现有源" : "导入并合并到现有源")
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) {
@@ -687,7 +867,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                         else if (which == 1) importFromClipboard(replace);
                         else if (which == 2) showImportUrlDialog(replace);
                     }
-                }).show();
+                }).show());
     }
 
     private void openImportFile(boolean replace) {
@@ -726,11 +906,9 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void showImportUrlDialog(final boolean replace) {
-        final EditText input = new EditText(this);
-        input.setHint("https://example.com/sources.json");
+        final EditText input = styledEdit("https://example.com/sources.json");
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        input.setSingleLine(true);
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("从订阅地址导入")
                 .setMessage("支持 LibreTV-SourceList、裸数组、TVBOX 配置或完整快照。")
                 .setView(input)
@@ -745,7 +923,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     }
                 })
                 .setNegativeButton("取消", null)
-                .show();
+                .show());
     }
 
     private void fetchImportUrl(final String url, final boolean replace) {
@@ -787,14 +965,99 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }, "ltv-import-url").start();
     }
 
+    private void showOnlineSourceDialog() {
+        if (web == null || !isLocalWebOrigin(web.getUrl())) {
+            toast("请先打开本地 LibreTV");
+            return;
+        }
+        EditText input = styledEdit("https://example.com/sources.json");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setText(prefs.getString(KEY_ONLINE_SOURCE_URL, ""));
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
+                .setTitle("在线更新点播源")
+                .setMessage("订阅地址只保存在本机。通过 HTTPS 拉取点播源，打开首页时最多每天更新一次。")
+                .setView(input)
+                .setPositiveButton("保存并更新", (dialog, which) -> {
+                    String url = input.getText().toString().trim();
+                    try {
+                        OnlineSourceSubscription.httpsUrl(url);
+                    } catch (IOException e) {
+                        toast("请输入有效的 HTTPS 订阅地址");
+                        return;
+                    }
+                    if (refreshingOnlineSources) {
+                        toast("订阅更新正在进行");
+                        return;
+                    }
+                    prefs.edit().putString(KEY_ONLINE_SOURCE_URL, url)
+                            .remove(KEY_ONLINE_SOURCE_FETCHED_AT).apply();
+                    refreshOnlineSources(true);
+                })
+                .setNeutralButton("停用自动更新", (dialog, which) -> {
+                    prefs.edit().remove(KEY_ONLINE_SOURCE_URL).remove(KEY_ONLINE_SOURCE_FETCHED_AT).apply();
+                    toast("已停用自动更新");
+                })
+                .setNegativeButton("取消", null)
+                .show());
+    }
+
+    private void refreshOnlineSources(boolean manual) {
+        String url = prefs.getString(KEY_ONLINE_SOURCE_URL, "");
+        if (url.isEmpty() || refreshingOnlineSources || web == null || importTemplate.isEmpty()
+                || !isLocalWebOrigin(web.getUrl())) return;
+        long now = System.currentTimeMillis();
+        long lastFetch = prefs.getLong(KEY_ONLINE_SOURCE_FETCHED_AT, 0);
+        if (!manual && lastFetch <= now && now - lastFetch < ONLINE_SOURCE_REFRESH_MS) return;
+        refreshingOnlineSources = true;
+        if (manual) toast("正在更新订阅…");
+        new Thread(() -> {
+            String result;
+            try {
+                result = OnlineSourceSubscription.fetch(url);
+            } catch (IOException e) {
+                result = null;
+            }
+            final String text = result;
+            runOnUiThread(() -> {
+                if (!url.equals(prefs.getString(KEY_ONLINE_SOURCE_URL, ""))) {
+                    refreshingOnlineSources = false;
+                    return;
+                }
+                if (web == null || !isLocalWebOrigin(web.getUrl())) {
+                    refreshingOnlineSources = false;
+                    return;
+                }
+                if (text == null) {
+                    refreshingOnlineSources = false;
+                    if (manual) toast("订阅更新失败，已保留原有源");
+                    return;
+                }
+                String script = importTemplate.replace("__MODE__", JSONObject.quote("online"))
+                        .replace("__RAW__", JSONObject.quote(text)).trim().replaceFirst(";\\s*$", "");
+                web.evaluateJavascript(onOrigin(localUrl(), "return (" + script + ");"), value -> {
+                    refreshingOnlineSources = false;
+                    String reply = jsString(value);
+                    if (reply != null && reply.startsWith("ok:")) {
+                        prefs.edit().putLong(KEY_ONLINE_SOURCE_FETCHED_AT, System.currentTimeMillis()).apply();
+                        if (manual) toast("已更新 " + reply.substring(3) + " 个点播源");
+                        if (web != null && isLocalWebOrigin(web.getUrl())
+                                && (manual || "/".equals(Uri.parse(web.getUrl()).getPath()))) web.reload();
+                    } else if (manual) {
+                        toast("订阅格式无效，已保留原有源");
+                    }
+                });
+            });
+        }, "ltv-online-sources").start();
+    }
+
     private void applyImportedSources(String raw, boolean replace) {
         if (web == null || importTemplate.isEmpty()) {
             toast("页面尚未加载，稍后再试");
             return;
         }
         String js = importTemplate
-                .replace("__RAW__", JSONObject.quote(raw))
-                .replace("__MODE__", JSONObject.quote(replace ? "replace" : "merge"));
+                .replace("__MODE__", JSONObject.quote(replace ? "replace" : "merge"))
+                .replace("__RAW__", JSONObject.quote(raw));
         appLog.i("import", "开始" + (replace ? "替换" : "合并") + "导入，"
                 + raw.length() + " 字符");
         web.evaluateJavascript(js, new ValueCallback<String>() {
@@ -866,7 +1129,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         sb.append("当前服务：").append(currentUrl.isEmpty() ? "未连接" : currentUrl).append('\n');
         sb.append("本地服务：").append(localMode ? "开启" : "关闭")
                 .append(" · 端口 ").append(localPort)
-                .append(" · 进程 ").append(localServer != null && localServer.isRunning() ? "运行中" : "未运行")
+                .append(" · 进程 ").append(localServer() != null && localServer().isRunning() ? "运行中" : "未运行")
                 .append('\n');
         sb.append("设备：Android ").append(Build.VERSION.RELEASE)
                 .append(" (API ").append(Build.VERSION.SDK_INT).append(") · ")
@@ -875,7 +1138,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 .append('\n');
         sb.append('\n');
         sb.append("===== Node 运行环境体检 =====\n");
-        sb.append(localServer == null ? "（本地服务未启动）" : localServer.envProbeText()).append("\n\n");
+        sb.append(localServer() == null ? "（本地服务未启动）" : localServer().envProbeText()).append("\n\n");
         sb.append("===== 应用日志（分级）=====\n");
         String app = appLog.all();
         if (app.length() > appLimit) {
@@ -883,7 +1146,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
         sb.append(app).append('\n');
         sb.append("===== Node 服务原始日志 =====\n");
-        String node = localServer == null ? "（本地服务未启动）" : localServer.nodeLogText();
+        String node = localServer() == null ? "（本地服务未启动）" : localServer().nodeLogText();
         if (node == null) node = "";
         if (node.length() > nodeLimit) {
             node = "…（仅保留最近部分）\n" + node.substring(node.length() - nodeLimit);
@@ -989,12 +1252,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         box.addView(auto);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(BG);
+        scroll.setBackground(roundStroke(BG, 12, LINE_SOFT));
         logBody = new TextView(this);
         logBody.setTextSize(11);
         logBody.setTextColor(TEXT);
         logBody.setTypeface(android.graphics.Typeface.MONOSPACE);
-        logBody.setPadding(dp(8), dp(8), dp(8), dp(8));
+        logBody.setPadding(dp(10), dp(10), dp(10), dp(10));
         scroll.addView(logBody, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
@@ -1016,6 +1279,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 })
                 .create();
         logDialog.show();
+        styleDarkDialog(logDialog);
         android.view.Window w = logDialog.getWindow();
         if (w != null) {
             w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1087,11 +1351,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         b.setPadding(dp(3), 0, dp(3), 0);
         if (primary) {
             b.setTextColor(Color.WHITE);
-            b.setBackground(round(ACCENT, 8));
+            b.setBackground(gradientRippleRound(ACCENT, ACCENT_BLUE, 10));
         } else {
             b.setTextColor(TEXT);
-            b.setBackground(round(SURFACE2, 8));
+            b.setBackground(rippleRound(SURFACE2, 10));
         }
+        attachSpringTouch(b);
         b.setOnClickListener(listener);
         return b;
     }
@@ -1138,7 +1403,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void confirmClearLog() {
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("清空日志")
                 .setMessage("将删除已保存的应用日志，此操作不可恢复。Node 服务原始日志与体检报告不受影响。")
                 .setPositiveButton("清空", new DialogInterface.OnClickListener() {
@@ -1150,14 +1415,14 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     }
                 })
                 .setNegativeButton("取消", null)
-                .show();
+                .show());
     }
 
     // ---------------------------------------------------------------- 输出通道
 
     private void chooseExportTarget(final String text, final String name, final String label) {
         final CharSequence[] items = {"保存到文件", "复制到剪贴板", "分享文本"};
-        new android.app.AlertDialog.Builder(this)
+        styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("导出" + label)
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) {
@@ -1165,7 +1430,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                         else if (which == 1) copyToClipboard(text, label);
                         else shareText(text, label);
                     }
-                }).show();
+                }).show());
     }
 
     private void saveToDocument(String text, String name) {
@@ -1277,45 +1542,104 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         mainBox.addView(web, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
+        watchActions = new LinearLayout(this);
+        watchActions.setOrientation(LinearLayout.HORIZONTAL);
+        watchActions.setGravity(Gravity.CENTER_VERTICAL);
+        watchActions.setPadding(dp(12), dp(8), dp(12), dp(7));
+        GradientDrawable watchHairline = new GradientDrawable();
+        watchHairline.setColor(0x287DD3FC);
+        GradientDrawable watchFill = new GradientDrawable();
+        watchFill.setColor(0xFF101929);
+        android.graphics.drawable.LayerDrawable watchBg = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[] { watchHairline, watchFill });
+        watchBg.setLayerInset(1, 0, dp(1), 0, 0);
+        watchActions.setBackground(watchBg);
+        watchActions.setVisibility(View.GONE);
+        mainBox.addView(watchActions, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        bottomDivider = new View(this);
+        bottomDivider.setBackground(new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] { 0x0000B8E6, 0x6600B8E6, 0x556366F1, 0x006366F1 }));
+        mainBox.addView(bottomDivider, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
+
+        bottomBarHost = new FrameLayout(this);
+        bottomBarHost.setBackgroundColor(SURFACE);
+
+        navActivePill = new View(this);
+        navActivePill.setBackground(roundStroke(0x2800B8E6, 14, 0x5500B8E6));
+        navActivePill.setAlpha(0f);
+        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(
+                dp(68), dp(46), Gravity.CENTER_VERTICAL | Gravity.START);
+        bottomBarHost.addView(navActivePill, pillLp);
+
         bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
-        bottomBar.setBackgroundColor(SURFACE);
-        bottomBar.setPadding(0, dp(2), 0, dp(2));
-        View divider = new View(this);
-        divider.setBackgroundColor(SURFACE2);
-        mainBox.addView(divider, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 1));
-        int barHeight = dp(getResources().getConfiguration().orientation
-                == android.content.res.Configuration.ORIENTATION_LANDSCAPE ? 50 : 62);
-        mainBox.addView(bottomBar, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, barHeight));
+        bottomBar.setBackgroundColor(Color.TRANSPARENT);
+        bottomBar.setPadding(dp(6), dp(4), dp(6), dp(4));
+        bottomBarHost.addView(bottomBar, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
 
-        bottomBar.addView(navButton(R.drawable.ic_home, "首页", new View.OnClickListener() {
+        int barHeight = dp(62);
+        mainBox.addView(bottomBarHost, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, barHeight));
+        bottomBarHost.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override public void onLayoutChange(View v, int l, int t, int r, int b,
+                    int ol, int ot, int or, int ob) {
+                if ((r - l) != (or - ol) && (r - l) > 0) {
+                    syncNavPillImmediate();
+                }
+            }
+        });
+
+        View homeNav = navButton(R.drawable.ic_home, "首页", new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (!currentUrl.isEmpty()) load(currentUrl);
             }
-        }));
-        bottomBar.addView(navButton(R.drawable.ic_back, "后退", new View.OnClickListener() {
+        });
+        navHomeIcon = (ImageView) ((LinearLayout) homeNav).getChildAt(0);
+        navHomeText = (TextView) ((LinearLayout) homeNav).getChildAt(1);
+        bottomBar.addView(homeNav);
+
+        View liveNav = navButton(R.drawable.ic_live, "直播", v -> {
+            if (!currentUrl.isEmpty() && !overlayVisible()) {
+                web.loadUrl(currentUrl + "/live");
+                updateBottomNavState(currentUrl + "/live");
+            } else {
+                toast("服务就绪后即可打开直播");
+            }
+        });
+        navLiveIcon = (ImageView) ((LinearLayout) liveNav).getChildAt(0);
+        navLiveText = (TextView) ((LinearLayout) liveNav).getChildAt(1);
+        bottomBar.addView(liveNav);
+
+        bottomBar.addView(navButton(R.drawable.ic_back, "返回", new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (web != null && web.canGoBack()) web.goBack();
                 else toast("已经是最早的页面");
             }
         }));
-        bottomBar.addView(navButton(R.drawable.ic_refresh, "刷新", new View.OnClickListener() {
-            @Override public void onClick(View v) { if (web != null) web.reload(); }
-        }));
-        bottomBar.addView(navButton(R.drawable.ic_fullscreen, "沉浸", new View.OnClickListener() {
-            @Override public void onClick(View v) { applyImmersive(true); }
-        }));
         bottomBar.addView(navButton(R.drawable.ic_settings, "设置", new View.OnClickListener() {
             @Override public void onClick(View v) { showSheet(); }
         }));
-        bottomBar.addView(navButton(R.drawable.ic_log, "日志", new View.OnClickListener() {
-            @Override public void onClick(View v) { showLogCenter(); }
-        }));
+
+        root.getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override public void onGlobalLayout() {
+                boolean nextIme = detectImeOpen();
+                if (nextIme != imeOpen) {
+                    imeOpen = nextIme;
+                    updateBottomBarVisibility();
+                    updateFabFullscreen();
+                }
+            }
+        });
 
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
+        progress.setProgressDrawable(auroraProgressDrawable(false));
         progress.setVisibility(View.GONE);
         FrameLayout.LayoutParams progressLp = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, dp(3), Gravity.TOP);
@@ -1328,9 +1652,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         fabRestore.setText("显示工具栏");
         fabRestore.setTextColor(TEXT);
         fabRestore.setTextSize(13);
-        fabRestore.setBackground(round(0xCC2A3140, 18));
+        fabRestore.setBackground(roundStroke(0xD8131C2B, 20, BORDER_GLOW));
         fabRestore.setPadding(dp(16), dp(9), dp(16), dp(9));
         fabRestore.setVisibility(View.GONE);
+        attachSpringTouch(fabRestore);
         fabRestore.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { applyImmersive(false); }
         });
@@ -1341,52 +1666,34 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         fabLp.setMargins(0, 0, dp(16), dp(20));
         root.addView(fabRestore, fabLp);
 
-        // 一键全屏：只在检测到页面里有 <video> 时浮现，避免遮挡浏览页面。
-        // 位置比「显示工具栏」高一层，两者不会重叠。
-        fabFullscreen = new TextView(this);
-        fabFullscreen.setText("全屏播放");
-        fabFullscreen.setTextColor(Color.WHITE);
-        fabFullscreen.setTextSize(14);
-        fabFullscreen.setGravity(Gravity.CENTER);
-        fabFullscreen.setMinWidth(dp(104));
-        fabFullscreen.setMinHeight(dp(52));
-        fabFullscreen.setPadding(dp(14), dp(10), dp(14), dp(10));
-        fabFullscreen.setBackground(round(0xDD4C8BF5, 16));
-        fabFullscreen.setClickable(true);
-        fabFullscreen.setFocusable(true);
-        fabFullscreen.setVisibility(View.GONE);
-        fabFullscreen.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { enterFullscreen(); }
-        });
-        FrameLayout.LayoutParams fsLp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM | Gravity.END);
-        fsLp.setMargins(0, 0, dp(16), dp(84));
-        root.addView(fabFullscreen, fsLp);
+        View watchDot = new View(this);
+        watchDot.setBackground(round(0xFF10B981, 4));
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(8), dp(8));
+        dotLp.rightMargin = dp(8);
+        watchActions.addView(watchDot, dotLp);
 
-        // 只要页面里有 <video> 就显示：竖屏播放时也能一键投屏
-        fabCast = new TextView(this);
-        fabCast.setText("投屏到电视");
-        fabCast.setTextColor(Color.WHITE);
-        fabCast.setTextSize(14);
-        fabCast.setGravity(Gravity.CENTER);
-        fabCast.setMinWidth(dp(104));
-        fabCast.setMinHeight(dp(52));
-        fabCast.setPadding(dp(14), dp(10), dp(14), dp(10));
-        fabCast.setBackground(round(0xDD2FA36B, 16));
-        fabCast.setClickable(true);
-        fabCast.setFocusable(true);
-        fabCast.setVisibility(View.GONE);
-        fabCast.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { showCastDialog(); }
-        });
-        FrameLayout.LayoutParams castLp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM | Gravity.END);
-        castLp.setMargins(0, 0, dp(16), dp(148));
-        root.addView(fabCast, castLp);
+        watchStatusText = new TextView(this);
+        watchStatusText.setText("播放器已就绪");
+        watchStatusText.setTextColor(TEXT_DIM);
+        watchStatusText.setTextSize(12);
+        watchStatusText.setSingleLine(true);
+        watchStatusText.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        if (Build.VERSION.SDK_INT >= 21) watchStatusText.setFontFeatureSettings("tnum");
+        watchActions.addView(watchStatusText, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        castAction = secondaryPillButton("投屏", v -> showCastDialog());
+        LinearLayout.LayoutParams castLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        castLp.rightMargin = dp(8);
+        watchActions.addView(castAction, castLp);
+
+        Button fsBtn = primaryButton("全屏", v -> enterFullscreen());
+        fsBtn.setTextSize(14);
+        fsBtn.setMinHeight(dp(44));
+        fsBtn.setMinimumHeight(dp(44));
+        fsBtn.setPadding(dp(18), 0, dp(18), 0);
+        watchActions.addView(fsBtn);
 
         // 沉浸层必须放在高级面板之下：手势层铺满全屏，但细进度线、右上「⋯」
         // 与高级面板要能优先拿到触摸，addView 顺序固定 gesture → line → toggle → panel。
@@ -1394,11 +1701,147 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         buildPlaybackBar();
     }
 
+    private boolean detectImeOpen() {
+        if (root == null) return false;
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsets insets = root.getRootWindowInsets();
+            if (insets != null) {
+                return insets.isVisible(android.view.WindowInsets.Type.ime());
+            }
+        }
+        Rect r = new Rect();
+        root.getWindowVisibleDisplayFrame(r);
+        View decor = root.getRootView();
+        int total = decor != null && decor.getHeight() > 0 ? decor.getHeight() : root.getHeight();
+        return total > 0 && (total - r.bottom) > total * 0.15f;
+    }
+
+    private android.graphics.drawable.Drawable auroraProgressDrawable(boolean roundedTrack) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0x18FFFFFF);
+        if (roundedTrack) bg.setCornerRadius(dp(4));
+
+        GradientDrawable fill = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] { 0xFF00C8F8, 0xFF3B82F6, 0xFFA855F7 });
+        if (roundedTrack) fill.setCornerRadius(dp(4));
+        android.graphics.drawable.ClipDrawable clip = new android.graphics.drawable.ClipDrawable(
+                fill, Gravity.START, android.graphics.drawable.ClipDrawable.HORIZONTAL);
+        android.graphics.drawable.LayerDrawable layers = new android.graphics.drawable.LayerDrawable(
+                new android.graphics.drawable.Drawable[] { bg, clip });
+        layers.setId(0, android.R.id.background);
+        layers.setId(1, android.R.id.progress);
+        return layers;
+    }
+
+    private float navPillTargetX(int slot) {
+        if (bottomBar == null) return 0f;
+        int totalW = bottomBar.getWidth();
+        int padL = bottomBar.getPaddingLeft();
+        int padR = bottomBar.getPaddingRight();
+        int innerW = totalW - padL - padR;
+        if (innerW <= 0) return 0f;
+        float slotW = innerW / 4f;
+        return padL + slot * slotW + dp(6);
+    }
+
+    private void ensureNavPillWidth() {
+        if (navActivePill == null || bottomBar == null) return;
+        int innerW = bottomBar.getWidth() - bottomBar.getPaddingLeft() - bottomBar.getPaddingRight();
+        if (innerW <= 0) return;
+        int desired = Math.max(dp(48), Math.round(innerW / 4f) - dp(12));
+        ViewGroup.LayoutParams lp = navActivePill.getLayoutParams();
+        if (lp != null && lp.width != desired) {
+            lp.width = desired;
+            navActivePill.setLayoutParams(lp);
+        }
+    }
+
+    private void syncNavPillImmediate() {
+        if (navActivePill == null) return;
+        ensureNavPillWidth();
+        int slot = "home".equals(lastNavRoute) ? 0 : ("live".equals(lastNavRoute) ? 1 : -1);
+        if (slot < 0) {
+            navActivePill.setAlpha(0f);
+            return;
+        }
+        navActivePill.setTranslationX(navPillTargetX(slot));
+        navActivePill.setAlpha(1f);
+    }
+
+    private void updateBottomBarVisibility() {
+        boolean hide = immersive || playbackMode || (imeOpen && !sheetVisible() && !overlayVisible());
+        int vis = hide ? View.GONE : View.VISIBLE;
+        if (bottomBarHost != null) bottomBarHost.setVisibility(vis);
+        if (bottomDivider != null) bottomDivider.setVisibility(vis);
+    }
+
+    private void updateBottomNavState(String url) {
+        String route = "";
+        if (url != null && !url.isEmpty()) {
+            try {
+                String path = Uri.parse(url).getPath();
+                if ("/live".equals(path) || "/live/".equals(path)) route = "live";
+                else if (path == null || path.isEmpty() || "/".equals(path)) route = "home";
+                else route = "other";
+            } catch (Exception ignored) { }
+        }
+        if (route.equals(lastNavRoute)) return;
+        lastNavRoute = route;
+        boolean homeActive = "home".equals(route);
+        boolean liveActive = "live".equals(route);
+        if (navHomeIcon != null) {
+            navHomeIcon.setColorFilter(homeActive ? ACCENT : TEXT);
+            navHomeIcon.animate().scaleX(homeActive ? 1.14f : 1f).scaleY(homeActive ? 1.14f : 1f)
+                    .setDuration(220).setInterpolator(new android.view.animation.OvershootInterpolator(1.3f)).start();
+        }
+        if (navHomeText != null) navHomeText.setTextColor(homeActive ? ACCENT : TEXT_DIM);
+        if (navLiveIcon != null) {
+            navLiveIcon.setColorFilter(liveActive ? ACCENT : TEXT);
+            navLiveIcon.animate().scaleX(liveActive ? 1.14f : 1f).scaleY(liveActive ? 1.14f : 1f)
+                    .setDuration(220).setInterpolator(new android.view.animation.OvershootInterpolator(1.3f)).start();
+        }
+        if (navLiveText != null) navLiveText.setTextColor(liveActive ? ACCENT : TEXT_DIM);
+
+        if (navActivePill != null) {
+            ensureNavPillWidth();
+            int slot = homeActive ? 0 : (liveActive ? 1 : -1);
+            navActivePill.animate().cancel();
+            if (slot >= 0 && bottomBar != null && bottomBar.getWidth() > 0) {
+                float tx = navPillTargetX(slot);
+                if (navActivePill.getAlpha() < 0.05f) {
+                    navActivePill.setTranslationX(tx);
+                    navActivePill.animate().alpha(1f).setDuration(200).start();
+                } else {
+                    navActivePill.animate().alpha(1f).translationX(tx)
+                            .setInterpolator(new android.view.animation.OvershootInterpolator(0.85f))
+                            .setDuration(260).start();
+                }
+            } else if (slot < 0) {
+                navActivePill.animate().alpha(0f).setDuration(180).start();
+            }
+        }
+    }
+
     private void updateFabFullscreen() {
-        int vis = hasVideo && !playbackMode && !immersive && customView == null
-                ? View.VISIBLE : View.GONE;
-        if (fabFullscreen != null) fabFullscreen.setVisibility(vis);
-        if (fabCast != null) fabCast.setVisibility(vis);
+        if (watchActions == null) return;
+        boolean show = hasVideo && !playbackMode && !immersive && customView == null
+                && !sheetVisible() && !overlayVisible() && !imeOpen;
+        int vis = show ? View.VISIBLE : View.GONE;
+        if (watchActions.getVisibility() != vis) {
+            watchActions.animate().cancel();
+            watchActions.setVisibility(vis);
+            if (show) {
+                watchActions.setAlpha(0f);
+                watchActions.setTranslationY(dp(8));
+                watchActions.animate().alpha(1f).translationY(0f)
+                        .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                        .setDuration(180).start();
+            } else {
+                watchActions.setAlpha(1f);
+                watchActions.setTranslationY(0f);
+            }
+        }
     }
 
     /** 一键全屏：网页全屏优先，CSS 铺满兜底；JS 上报后切到全屏播放态。 */
@@ -1439,10 +1882,13 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private void buildImmersiveLayer() {
         // 之前是 0x66FFFFFF（40% 白）3dp，压在亮画面（雪景、白墙、字幕页）上几乎看不见，
         // 用户反馈「播放时看不到进度条」。改成更实的高光 + 深色底衬 + 加粗。
-        lineBgPaint.setColor(0xA6FFFFFF);      // 未播放：65% 白
-        linePlayedPaint.setColor(0xFFFF3B5C);  // 已播放：主题红
-        lineShadowPaint.setColor(0x73000000);  // 底衬：45% 黑，保证亮画面上也有对比
-        lineDotPaint.setColor(0xFFFFFFFF);     // 进度圆点
+        lineBgPaint.setColor(0x8AFFFFFF);
+        linePlayedPaint.setColor(0xFF00C8F8);
+        lineGlowPaint.setColor(0x5500C8F8);
+        lineShadowPaint.setColor(0x73000000);
+        lineDotPaint.setColor(0xFFFFFFFF);
+        hudTrackPaint.setColor(0x28FFFFFF);
+        hudFillPaint.setColor(0xFF00C8F8);
 
         gestureLayer = new View(this);
         gestureLayer.setBackgroundColor(Color.TRANSPARENT);
@@ -1479,7 +1925,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 if (ratio > 0) c.drawRect(0, y - th, w * ratio, y + th, linePlayedPaint);
                 // 4) 进度圆点：明确指出当前播放位置，也方便判断能不能拖
                 if (ratio > 0) {
-                    float cx = Math.min(w - dp(5), Math.max(dp(5), w * ratio));
+                    float cx = Math.min(w - dp(6), Math.max(dp(6), w * ratio));
+                    c.drawCircle(cx, y, dp(8), lineGlowPaint);
                     c.drawCircle(cx, y, dp(5), lineDotPaint);
                     c.drawCircle(cx, y, dp(3), linePlayedPaint);
                 }
@@ -1496,7 +1943,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 }
                 float ratio = Math.max(0f, Math.min(1f, e.getX() / Math.max(1f, getWidth())));
                 double sec = lastDuration * ratio;
-                showGestureHint("快进 " + fmtTime(sec) + " / " + fmtTime(lastDuration));
+                showGestureHint("快进 " + fmtTime(sec) + " / " + fmtTime(lastDuration), ratio);
                 // 按下即跳、拖动即跳：不等松手，避免「点不上去」
                 callJs("window.__ltv && window.__ltv.seekTo(" + sec + ")");
                 if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) scheduleHintHide(700);
@@ -1535,15 +1982,16 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         exitBtn = new TextView(this);
         // 文案写全「退出全屏」：只写「退出」容易被理解成退出 App
         exitBtn.setText("✕ 退出全屏");
-        exitBtn.setTextColor(0xE6FFFFFF);
+        exitBtn.setTextColor(0xF0EEF5FF);
         exitBtn.setTextSize(13);
         exitBtn.setGravity(Gravity.CENTER);
         exitBtn.setPadding(dp(14), 0, dp(14), 0);
-        exitBtn.setBackground(round(0x80000000, 20));
+        exitBtn.setBackground(roundStroke(0xBF0E1626, 20, BORDER_GLOW));
         exitBtn.setMinHeight(dp(40));
         exitBtn.setClickable(true);
         exitBtn.setFocusable(true);
         exitBtn.setVisibility(View.GONE);
+        attachSpringTouch(exitBtn);
         exitBtn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { exitPlayback(); }
         });
@@ -1555,14 +2003,15 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         panelToggle = new TextView(this);
         panelToggle.setText("⋯");
-        panelToggle.setTextColor(0xDDFFFFFF);
+        panelToggle.setTextColor(0xEAEEF5FF);
         panelToggle.setTextSize(22);
         panelToggle.setGravity(Gravity.CENTER);
-        panelToggle.setBackground(round(0x66000000, 22));
+        panelToggle.setBackground(roundStroke(0xBF0E1626, 22, BORDER_GLOW));
         panelToggle.setMinWidth(dp(44));
         panelToggle.setMinHeight(dp(44));
         panelToggle.setClickable(true);
         panelToggle.setVisibility(View.GONE);
+        attachSpringTouch(panelToggle);
         panelToggle.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { toggleAdvancedPanel(); }
         });
@@ -1572,27 +2021,30 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         tLp.setMargins(0, dp(14), dp(16), 0);
         root.addView(panelToggle, tLp);
 
-        // 投屏按钮放在「⋯」左侧，全屏播放时一键推送到电视
-        //
-        // ← 1.2.4 起这里不再创建原生投屏按钮。
-        //
-        // 原因：播放态里网页 DOM 的按钮行（左上「✕ 退出全屏」+「投屏」）已经被
-        // setUiVisible(true) 强制显示，而原生层这颗画在右上「⋯」旁边 ——
-        // 同屏出现两个投屏图标（用户截图反馈「出现了2个投屏图标」）。
-        //
-        // 留哪一颗？留网页那颗：
-        //   1) 它和投屏面板在同一层（网页 DOM），点开的面板一定看得到；
-        //      原生按钮在部分机型播放时压根不上屏（历史上一串「找不到投屏」都是这个坑）；
-        //   2) 它的文案 / 状态由 updateCastToggle() 通过 setCast() 回写，本来就同步；
-        //   3) 非全屏的浏览 / 竖屏小窗场景仍由右下角悬浮按钮 fabCast 承担入口，不缺。
-        // 所以原生这颗彻底去掉，从根上杜绝「两个投屏图标」。
-
-        gestureHint = new TextView(this);
-        gestureHint.setTextColor(Color.WHITE);
-        gestureHint.setTextSize(18);
+        gestureHint = new TextView(this) {
+            @Override protected void onDraw(Canvas c) {
+                super.onDraw(c);
+                if (gestureLevel >= 0f && getWidth() > dp(44)) {
+                    int w = getWidth(), h = getHeight();
+                    float left = dp(18), right = w - dp(18);
+                    float bottom = h - dp(7), top = bottom - dp(4);
+                    float r = dp(2);
+                    hudRect.set(left, top, right, bottom);
+                    c.drawRoundRect(hudRect, r, r, hudTrackPaint);
+                    float ratio = Math.max(0f, Math.min(1f, gestureLevel));
+                    if (ratio > 0f) {
+                        hudRect.set(left, top, left + (right - left) * ratio, bottom);
+                        c.drawRoundRect(hudRect, r, r, hudFillPaint);
+                    }
+                }
+            }
+        };
+        gestureHint.setTextColor(TEXT);
+        gestureHint.setTextSize(16);
         gestureHint.setGravity(Gravity.CENTER);
-        gestureHint.setPadding(dp(18), dp(10), dp(18), dp(10));
-        gestureHint.setBackground(round(0xCC11151C, 14));
+        gestureHint.setMinWidth(dp(140));
+        gestureHint.setPadding(dp(20), dp(12), dp(20), dp(18));
+        gestureHint.setBackground(roundStroke(0xE00E1626, 16, BORDER_GLOW));
         gestureHint.setClickable(false);
         gestureHint.setVisibility(View.GONE);
         root.addView(gestureHint, new FrameLayout.LayoutParams(
@@ -1601,6 +2053,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void setImmersiveLayers(boolean on) {
+        on = on && !inPictureInPicture();
         immersiveLayersOn = on;
         if (gestureLayer != null) gestureLayer.setVisibility(on ? View.VISIBLE : View.GONE);
         if (panelToggle != null) panelToggle.setVisibility(on ? View.VISIBLE : View.GONE);
@@ -1633,7 +2086,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         if (exitBtn == null) return;
         /* 网页已经画了自己那颗按钮时，原生这颗只在「网页不可见」的 native 全屏
            （custom view 抢占了画面）里补位，否则会出现两个退出口。 */
-        boolean show = playbackMode && (customView != null || !domUiActive);
+        boolean show = playbackMode && !inPictureInPicture() && (customView != null || !domUiActive);
         exitBtn.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show) exitBtn.bringToFront();
     }
@@ -1644,7 +2097,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
      *  原生这条只在「网页被藏起来」的 native 全屏（custom view）里补位。 */
     private void syncProgressLine() {
         if (progressLine == null) return;
-        boolean show = playbackMode && customView != null
+        boolean show = playbackMode && !inPictureInPicture() && customView != null
                 && !webControlsMode && !advancedPanelVisible;
         progressLine.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show) {
@@ -1654,16 +2107,48 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void showGestureHint(String text) {
+        showGestureHint(text, -1f);
+    }
+
+    private void showGestureHint(String text, float level) {
         if (gestureHint == null) return;
+        gestureLevel = level;
         gestureHint.setText(text);
-        gestureHint.setVisibility(View.VISIBLE);
+        gestureHint.invalidate();
+        if (gestureHint.getVisibility() != View.VISIBLE) {
+            gestureHint.animate().cancel();
+            gestureHint.setVisibility(View.VISIBLE);
+            gestureHint.setAlpha(0f);
+            gestureHint.setScaleX(0.90f);
+            gestureHint.setScaleY(0.90f);
+            gestureHint.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .setDuration(140).start();
+        } else {
+            gestureHint.animate().cancel();
+            gestureHint.setAlpha(1f);
+            gestureHint.setScaleX(1f);
+            gestureHint.setScaleY(1f);
+        }
     }
 
     private void scheduleHintHide(long delay) {
         if (gestureHintTask != null) controlHandler.removeCallbacks(gestureHintTask);
         gestureHintTask = new Runnable() {
             @Override public void run() {
-                if (gestureHint != null) gestureHint.setVisibility(View.GONE);
+                if (gestureHint == null || gestureHint.getVisibility() != View.VISIBLE) return;
+                gestureHint.animate().cancel();
+                gestureHint.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(140)
+                        .withEndAction(new Runnable() {
+                            @Override public void run() {
+                                if (gestureHint != null) {
+                                    gestureHint.setVisibility(View.GONE);
+                                    gestureHint.setAlpha(1f);
+                                    gestureHint.setScaleX(1f);
+                                    gestureHint.setScaleY(1f);
+                                }
+                            }
+                        }).start();
             }
         };
         controlHandler.postDelayed(gestureHintTask, delay);
@@ -1675,29 +2160,46 @@ public class MainActivity extends Activity implements LocalServer.Callback {
      * 放行（DOWN 返回 false，ViewGroup 会把事件继续分发给 WebView），否则网页里
      * 的按钮和进度条永远点不到。
      */
-    private boolean pageUiZone(float x, float y, int h) {
-        /* 两颗按钮横排：「✕ 退出全屏」约 110dp + 8dp 间距 + 「投屏」约 76dp，
-           取 250dp 留出大字号 / 长文案的余量。 */
-        if (x <= dp(250) && y <= dp(76)) return true;   // 左上：退出全屏 / 投屏
-        if (y >= h - dp(96)) return true;               // 底部控制栏 / 迷你进度条
+    private boolean pageUiZone(float x, float y, int w, int h) {
+        if (y <= dp(112) && x <= w - dp(72)) return true; // 左上：退出全屏 / 投屏 / 播放设置（兼容大字体与挖孔安全区）
+        if (y >= h - dp(120)) return true;                 // 底部控制栏 / 跳过片头 / 迷你进度条
         return false;
     }
 
-    /** 全屏手势：单击暂停/播放、左右滑快进、左半屏亮度、右半屏音量。 */
+    private void cancelPendingSingleTap() {
+        if (singleTapTask != null) {
+            controlHandler.removeCallbacks(singleTapTask);
+            singleTapTask = null;
+        }
+    }
+
+    private void cancelLongPressRate() {
+        if (longPressRateTask != null) {
+            controlHandler.removeCallbacks(longPressRateTask);
+            longPressRateTask = null;
+        }
+    }
+
+    /** 全屏手势：单击切换控制条、双击左右快退/快进及中间播放/暂停、长按 2.0× 倍速、左右滑精细进度、左右半屏亮度/音量。 */
     private boolean handleGesture(View v, MotionEvent e) {
         /* 投屏面板是网页画的，铺满整屏；手势层此时必须完全让开，否则面板里的
            设备行与按钮收不到触摸（表现就是「面板出来了但点不动」）。 */
-        if (castPanelOpen) return false;
+        if (castPanelOpen || playbackPanelOpen) return false;
         if (!playbackMode || !immersiveLayersOn || advancedPanelVisible || webControlsMode) return false;
         switch (e.getAction()) {
             case MotionEvent.ACTION_DOWN:
                 /* 落在网页 UI 上就直接放弃这一串手势，让触摸继续下发到 WebView。
                    ViewGroup 的规则：子 View 在 DOWN 上返回 false 就换下一个子 View。 */
-                if (pageUiZone(e.getX(), e.getY(), v.getHeight())) return false;
+                if (pageUiZone(e.getX(), e.getY(), v.getWidth(), v.getHeight())) {
+                    callJs("window.__ltv && window.__ltv.wakeHud && window.__ltv.wakeHud()");
+                    return false;
+                }
+                cancelLongPressRate();
                 gDownX = gLastX = e.getX();
                 gDownY = gLastY = e.getY();
                 gDownTime = System.currentTimeMillis();
                 gMode = 0;
+                tempSpeedBoosting = false;
                 gStartSec = lastCurrent;
                 gPreviewSec = gStartSec;
                 gStartBrightness = getWindow().getAttributes().screenBrightness;
@@ -1706,21 +2208,53 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 if (amDown != null) {
                     gStartVolume = amDown.getStreamVolume(AudioManager.STREAM_MUSIC);
                     gMaxVolume = amDown.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                    gVolumeFloat = gStartVolume;
                 }
+                longPressRateTask = new Runnable() {
+                    @Override public void run() {
+                        longPressRateTask = null;
+                        if (!playbackMode || !immersiveLayersOn || advancedPanelVisible || webControlsMode || gMode != 0) return;
+                        tempSpeedBoosting = true;
+                        cancelPendingSingleTap();
+                        lastTapUpMs = 0;
+                        callJs("window.__ltv && window.__ltv.setTempRate && window.__ltv.setTempRate(true)");
+                        showGestureHint("⏩ 2.0× 倍速播放中", 1f);
+                    }
+                };
+                controlHandler.postDelayed(longPressRateTask, 450);
                 return true;
             case MotionEvent.ACTION_MOVE: {
                 float dx = e.getX() - gDownX, dy = e.getY() - gDownY;
+                float ax = Math.abs(dx), ay = Math.abs(dy);
+                if (ax > dp(14) || ay > dp(14)) {
+                    cancelLongPressRate();
+                }
+                if (tempSpeedBoosting) {
+                    return true;
+                }
                 if (gMode == 0) {
-                    float ax = Math.abs(dx), ay = Math.abs(dy);
-                    if (ax > dp(18) && ax > ay * 1.1f) gMode = 1;
-                    else if (ay > dp(18)) gMode = (gDownX < v.getWidth() / 2f) ? 2 : 3;
-                    else return true;
+                    if (ax > dp(16) && ax > ay * 1.15f) {
+                        gMode = 1;
+                        cancelPendingSingleTap();
+                        lastTapUpMs = 0;
+                    } else if (ay > dp(16)) {
+                        gMode = (gDownX < v.getWidth() / 2f) ? 2 : 3;
+                        cancelPendingSingleTap();
+                        lastTapUpMs = 0;
+                    } else {
+                        return true;
+                    }
                 }
                 if (gMode == 1) {
                     if (lastDuration > 0) {
-                        double delta = dx / Math.max(1f, v.getWidth()) * lastDuration * 0.8;
+                        double span = Math.min(lastDuration, 180.0);
+                        double delta = (dx / Math.max(1f, v.getWidth())) * span;
                         gPreviewSec = Math.max(0, Math.min(lastDuration, gStartSec + delta));
-                        showGestureHint("快进 " + fmtTime(gPreviewSec) + " / " + fmtTime(lastDuration));
+                        double signed = gPreviewSec - gStartSec;
+                        showGestureHint(
+                                (signed >= 0 ? "⏩ " : "⏪ ") + fmtTime(gPreviewSec) + " / " + fmtTime(lastDuration)
+                                        + String.format(Locale.CHINA, " (%+ds)", Math.round(signed)),
+                                (float) (gPreviewSec / Math.max(1.0, lastDuration)));
                     }
                 } else if (gMode == 2) {
                     float b = Math.max(0.05f, Math.min(1f,
@@ -1728,14 +2262,16 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     WindowManager.LayoutParams lp = getWindow().getAttributes();
                     lp.screenBrightness = b;
                     getWindow().setAttributes(lp);
-                    showGestureHint("亮度 " + Math.round(b * 100) + "%");
+                    showGestureHint("☀ 亮度 " + Math.round(b * 100) + "%", b);
                 } else if (gMode == 3) {
                     AudioManager amMove = (AudioManager) getSystemService(AUDIO_SERVICE);
                     if (amMove != null && gMaxVolume > 0) {
-                        int vol = (int) Math.max(0, Math.min(gMaxVolume,
-                                gStartVolume - dy / Math.max(1f, v.getHeight()) * gMaxVolume * 1.4));
+                        float nextVol = Math.max(0f, Math.min((float) gMaxVolume,
+                                gVolumeFloat - dy / Math.max(1f, v.getHeight()) * gMaxVolume * 1.35f));
+                        float ratio = nextVol / Math.max(1f, gMaxVolume);
+                        int vol = Math.round(nextVol);
                         amMove.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0);
-                        showGestureHint("音量 " + vol + " / " + gMaxVolume);
+                        showGestureHint("🔊 音量 " + Math.round(ratio * 100) + "%", ratio);
                     }
                 }
                 gLastX = e.getX();
@@ -1743,29 +2279,60 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 return true;
             }
             case MotionEvent.ACTION_UP:
-                if (gMode == 1 && lastDuration > 0) {
+                cancelLongPressRate();
+                if (tempSpeedBoosting) {
+                    tempSpeedBoosting = false;
+                    callJs("window.__ltv && window.__ltv.setTempRate && window.__ltv.setTempRate(false)");
+                    showGestureHint("已恢复正常倍速");
+                    scheduleHintHide(550);
+                } else if (gMode == 1 && lastDuration > 0) {
                     callJs("window.__ltv && window.__ltv.seekTo(" + gPreviewSec + ")");
-                    toast("跳到 " + fmtTime(gPreviewSec));
-                    scheduleHintHide(700);
-                } else if (gMode == 0 && System.currentTimeMillis() - gDownTime < 350) {
-                    callJs("window.__ltv && window.__ltv.toggle()");
-                    showGestureHint("播放 / 暂停");
-                    scheduleHintHide(700);
-                } else if (gMode == 0 && System.currentTimeMillis() - gDownTime >= 600) {
-                    /* 长按画面（不滑动）＝ 唤出完整控制面板。
-                       单击已经给了播放/暂停，长按留作「找按钮」的第二次机会：
-                       面板里有 退出 / 网页 / 画面 / 进度条拖拽，比让用户盲点强。 */
-                    showAdvancedPanel();
-                    showGestureHint("控制面板");
-                    scheduleHintHide(600);
+                    scheduleHintHide(550);
+                } else if (gMode == 0 && System.currentTimeMillis() - gDownTime < 450) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastTapUpMs <= 260 && Math.hypot(e.getX() - lastTapUpX, e.getY() - lastTapUpY) <= dp(42)) {
+                        cancelPendingSingleTap();
+                        lastTapUpMs = 0;
+                        float x = e.getX(), w = Math.max(1f, v.getWidth());
+                        if (x < w * 0.32f) {
+                            callJs("window.__ltv && window.__ltv.seek(-10)");
+                            showGestureHint("⏪ 快退 10 秒");
+                        } else if (x > w * 0.68f) {
+                            callJs("window.__ltv && window.__ltv.seek(10)");
+                            showGestureHint("⏩ 快进 10 秒");
+                        } else {
+                            callJs("window.__ltv && window.__ltv.toggle()");
+                            showGestureHint("⏯ 播放 / 暂停");
+                        }
+                        scheduleHintHide(650);
+                    } else {
+                        lastTapUpMs = now;
+                        lastTapUpX = e.getX();
+                        lastTapUpY = e.getY();
+                        cancelPendingSingleTap();
+                        singleTapTask = new Runnable() {
+                            @Override public void run() {
+                                singleTapTask = null;
+                                if (!playbackMode || !immersiveLayersOn || advancedPanelVisible || webControlsMode) return;
+                                callJs("window.__ltv && window.__ltv.toggleControls ? window.__ltv.toggleControls() : (window.__ltv && window.__ltv.showControls())");
+                            }
+                        };
+                        controlHandler.postDelayed(singleTapTask, 240);
+                    }
                 } else if (gMode != 0) {
-                    scheduleHintHide(700);
+                    scheduleHintHide(550);
                 }
                 gMode = 0;
                 return true;
             case MotionEvent.ACTION_CANCEL:
+                cancelLongPressRate();
+                cancelPendingSingleTap();
+                if (tempSpeedBoosting) {
+                    tempSpeedBoosting = false;
+                    callJs("window.__ltv && window.__ltv.setTempRate && window.__ltv.setTempRate(false)");
+                }
                 gMode = 0;
-                scheduleHintHide(400);
+                scheduleHintHide(350);
                 return true;
         }
         return true;
@@ -1779,7 +2346,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     private void buildPlaybackBar() {
         playbackBar = new LinearLayout(this);
         playbackBar.setOrientation(LinearLayout.VERTICAL);
-        playbackBar.setBackground(round(0xE61B1F27, 16));
+        playbackBar.setBackground(roundStroke(0xEB0E1626, 18, BORDER_GLOW));
         playbackBar.setPadding(dp(12), dp(10), dp(12), dp(8));
         playbackBar.setVisibility(View.GONE);
         playbackBar.setClickable(true);
@@ -1914,6 +2481,40 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
     }
 
+    private void animatePlaybackBar(boolean show) {
+        if (playbackBar == null) return;
+        playbackBarTargetVisible = show;
+        playbackBar.animate().cancel();
+        if (show) {
+            boolean wasHidden = playbackBar.getVisibility() != View.VISIBLE;
+            playbackBar.setClickable(true);
+            playbackBar.setVisibility(View.VISIBLE);
+            playbackBar.bringToFront();
+            if (wasHidden) {
+                playbackBar.setAlpha(0f);
+                playbackBar.setTranslationY(dp(10));
+            }
+            playbackBar.animate().alpha(1f).translationY(0f)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                    .setDuration(180).start();
+        } else {
+            playbackBar.setClickable(false);
+            if (playbackBar.getVisibility() != View.VISIBLE) {
+                playbackBar.setAlpha(1f);
+                playbackBar.setTranslationY(0f);
+                return;
+            }
+            playbackBar.animate().alpha(0f).translationY(dp(8)).setDuration(140)
+                    .withEndAction(() -> {
+                        if (!playbackBarTargetVisible && playbackBar != null) {
+                            playbackBar.setVisibility(View.GONE);
+                            playbackBar.setAlpha(1f);
+                            playbackBar.setTranslationY(0f);
+                        }
+                    }).start();
+        }
+    }
+
     /** 经典模式：轻触画面 / 操作按钮时唤出控制条，4 秒后收起。 */
     private void showPlaybackBarTemporarily() {
         if (!playbackMode || playbackBar == null) return;
@@ -1922,11 +2523,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         webControlsMode = false;
         lastPanelActionMs = System.currentTimeMillis();
         cancelControlHide();
-        playbackBar.animate().cancel();
-        playbackBar.setAlpha(1f);
-        playbackBar.setClickable(true);
-        playbackBar.setVisibility(View.VISIBLE);
-        playbackBar.bringToFront();
+        animatePlaybackBar(true);
         callJs("window.__ltv && window.__ltv.setNativeBar(true)");
         if (!prefs.getBoolean(KEY_CONTROL_AUTOHIDE, true)) return;
         controlHideTask = new Runnable() {
@@ -1935,14 +2532,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         controlHandler.postDelayed(controlHideTask, CONTROL_HIDE_DELAY_MS);
     }
 
-    /** 直接 GONE，不用 alpha 淡出：alpha=0 但 VISIBLE 的面板会变成透明遮罩吃掉触摸。 */
+    /** 退场淡出同时立即关闭 Clickable，动画结束立刻 GONE 防止透明挡触摸。 */
     private void hidePlaybackBar() {
         cancelControlHide();
-        if (playbackBar == null) return;
-        playbackBar.animate().cancel();
-        playbackBar.setAlpha(1f);
-        playbackBar.setVisibility(View.GONE);
-        playbackBar.setClickable(false);
+        animatePlaybackBar(false);
     }
 
     private void toggleAdvancedPanel() {
@@ -1964,11 +2557,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         callJs("window.__ltv && window.__ltv.setNativeBar(true)");
         // 网页里那些浮在底部的按钮（跳过片头/片尾）要让开，否则正压在面板按钮行上
         callJs("window.__ltv && window.__ltv.setPanel(true)");
-        playbackBar.animate().cancel();
-        playbackBar.setAlpha(1f);
-        playbackBar.setClickable(true);
-        playbackBar.setVisibility(View.VISIBLE);
-        playbackBar.bringToFront();
+        animatePlaybackBar(true);
         // 面板自带 SeekBar，必须收起底部细进度线：两者同显会叠在画面底部抢触摸
         syncProgressLine();
         controlHideTask = new Runnable() {
@@ -1981,10 +2570,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         cancelControlHide();
         advancedPanelVisible = false;
         if (playbackBar == null) { syncProgressLine(); return; }
-        playbackBar.animate().cancel();
-        playbackBar.setAlpha(1f);
-        playbackBar.setVisibility(View.GONE);
-        playbackBar.setClickable(false);
+        animatePlaybackBar(false);
         callJs("window.__ltv && window.__ltv.setPanel(false)");
         syncProgressLine();
     }
@@ -2052,9 +2638,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         t.setMinWidth(dp(56));
         t.setMinHeight(dp(52));
         t.setPadding(dp(9), dp(10), dp(9), dp(10));
-        t.setBackground(round(SURFACE2, 10));
+        t.setBackground(rippleRound(SURFACE2, 11));
         t.setClickable(true);
         t.setFocusable(true);
+        attachSpringTouch(t);
         t.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 listener.onClick(v);
@@ -2161,7 +2748,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     "停止投屏", "把手机当前进度同步到电视",
                     "切换电视 / 重新搜索", "系统屏幕镜像（投整个手机画面）"
             };
-            new android.app.AlertDialog.Builder(this)
+            styleDarkDialog(new android.app.AlertDialog.Builder(this)
                     .setTitle("正在投屏到 " + d.name)
                     .setItems(items, new DialogInterface.OnClickListener() {
                         @Override public void onClick(DialogInterface g, int which) {
@@ -2172,7 +2759,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                         }
                     })
                     .setNegativeButton("关闭", null)
-                    .show();
+                    .show());
             return;
         }
         showCastScanning();
@@ -2192,7 +2779,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         body.setPadding(dp(22), dp(18), dp(22), dp(8));
         body.setLineSpacing(dp(4), 1f);
 
-        castDialog = new android.app.AlertDialog.Builder(this)
+        castDialog = styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle("投屏到电视")
                 .setView(body)
                 .setPositiveButton("重新搜索", new DialogInterface.OnClickListener() {
@@ -2202,7 +2789,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     @Override public void onClick(DialogInterface g, int w) { openSystemCast(); }
                 })
                 .setNeutralButton("关闭", null)
-                .show();
+                .show());
 
         final android.app.AlertDialog ref = castDialog;
         appLog.i("cast", "开始 SSDP 搜索投屏设备");
@@ -2230,7 +2817,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             labels.add("（没发现设备）重新搜索");
         }
         CharSequence[] arr = labels.toArray(new CharSequence[0]);
-        castDialog = new android.app.AlertDialog.Builder(this)
+        castDialog = styleDarkDialog(new android.app.AlertDialog.Builder(this)
                 .setTitle(ds.isEmpty() ? "没发现投屏设备" : "选择投屏设备")
                 .setItems(arr, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface g, int which) {
@@ -2245,7 +2832,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     @Override public void onClick(DialogInterface g, int w) { openSystemCast(); }
                 })
                 .setNeutralButton("关闭", null)
-                .show();
+                .show());
     }
 
     /** 取当前视频直链 → 转成电视可访问的地址 → SOAP 推送。 */
@@ -2266,7 +2853,6 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                             u = o.optString("u", "");
                             t = o.optString("t", "LibreTV 投屏");
                         } catch (Exception ignored) { }
-                        if (u.isEmpty()) u = lastStreamUrl;
                         if (u.isEmpty()) {
                             toast("还没拿到视频直链，请先让影片开始播放；或用「系统屏幕镜像」投整个画面");
                             appLog.w("cast", "未取得视频直链，投屏中止");
@@ -2477,8 +3063,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
     private void updateCastToggle() {
         DlnaCast.Device d = cast != null ? cast.current() : null;
-        if (fabCast != null) {
-            fabCast.setText(d != null ? "投屏中 · 管理" : "投屏到电视");
+        if (castAction != null) {
+            castAction.setText(d != null ? "管理投屏" : "投屏");
+            castAction.setBackground(d != null
+                    ? gradientRippleRound(0xFF10B981, 0xFF059669, 11)
+                    : rippleRound(SURFACE2, 11));
+            castAction.setTextColor(d != null ? Color.WHITE : TEXT);
         }
         /* 网页 DOM 里那颗投屏按钮是用户真正看得见的那颗（原生层全屏时可能不上屏），
            文案必须跟着投屏状态一起变，否则点了没反应用户会以为功能坏了。 */
@@ -2537,7 +3127,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             }
             if (sheetVisible()) hideSheet();
             if (overlayVisible()) hideOverlay();
-            bottomBar.setVisibility(View.GONE);
+            updateBottomBarVisibility();
             fabRestore.setVisibility(View.GONE);
 
             // 网页控制栏全程让位；视频按用户选择的模式铺满
@@ -2571,6 +3161,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         } else {
             // 退出全屏必须撤掉所有覆盖样式与手势层，否则竖屏小播放器会没有网页控制栏
             cancelControlHide();
+            cancelLongPressRate();
+            cancelPendingSingleTap();
+            if (tempSpeedBoosting) {
+                tempSpeedBoosting = false;
+                callJs("window.__ltv && window.__ltv.setTempRate && window.__ltv.setTempRate(false)");
+            }
             webControlsMode = false;
             advancedPanelVisible = false;
             setImmersiveLayers(false);
@@ -2579,10 +3175,12 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             /* 回到网页自己的可见性判定：竖屏小窗里不该再顶着一行按钮 */
             callJs("window.__ltv && window.__ltv.setUiVisible(null)");
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-            bottomBar.setVisibility(immersive ? View.GONE : View.VISIBLE);
+            updateBottomBarVisibility();
             fabRestore.setVisibility(immersive ? View.VISIBLE : View.GONE);
+            playbackBarTargetVisible = false;
             playbackBar.animate().cancel();
             playbackBar.setAlpha(1f);
+            playbackBar.setTranslationY(0f);
             playbackBar.setVisibility(View.GONE);
             playbackBar.setClickable(false);
             brightnessStep = 0;
@@ -2629,21 +3227,109 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
     }
 
+    private static int effectivePort(java.net.URI uri) {
+        return uri.getPort() != -1 ? uri.getPort() : ("https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80);
+    }
+
+    private static boolean sameWebOrigin(String left, String right) {
+        if (left == null || right == null) return false;
+        try {
+            java.net.URI a = new java.net.URI(left);
+            java.net.URI b = new java.net.URI(right);
+            String scheme = a.getScheme();
+            return ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                    && scheme.equalsIgnoreCase(b.getScheme())
+                    && a.getHost() != null && a.getHost().equalsIgnoreCase(b.getHost())
+                    && a.getUserInfo() == null && b.getUserInfo() == null
+                    && effectivePort(a) == effectivePort(b);
+        } catch (java.net.URISyntaxException e) {
+            return false;
+        }
+    }
+
+    private boolean isLocalWebOrigin(String url) {
+        return localMode && sameWebOrigin(url, localUrl()) && sameWebOrigin(currentUrl, localUrl());
+    }
+
+    private static String onOrigin(String url, String script) {
+        return "(function(){if(window.top!==window || location.origin!==new URL("
+                + JSONObject.quote(url) + ").origin)return;\n" + script + "\n})();";
+    }
+
+    private String bridgeSetup(String token) {
+        return "(function(token){var nativeBridge=window.LtvBridgeNative;var api={};"
+                + "('onFullscreen exitFullscreen cast castStart castPick castStop castSync castPause castSeek "
+                + "castPoll castSystem castPanel setDomUi log onVideo onProgress onDiagnosis playbackPanel"
+                + (supportsPip() ? " requestPictureInPicture" : "") + "')"
+                + ".split(' ').forEach(function(name){"
+                + "api[name]=function(){return nativeBridge[name].apply(nativeBridge,"
+                + "[token].concat(Array.prototype.slice.call(arguments)));};});"
+                + "window.LtvBridge=api;})(" + JSONObject.quote(token) + ");";
+    }
+
+    private void runBridge(String token, Runnable action) {
+        runOnUiThread(() -> {
+            if (web != null && bridgeToken != null && bridgeToken.equals(token)
+                    && sameWebOrigin(web.getUrl(), currentUrl)) action.run();
+        });
+    }
+
+    private boolean supportsPip() {
+        return Build.VERSION.SDK_INT >= 26
+                && getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE);
+    }
+
+    private boolean inPictureInPicture() {
+        return Build.VERSION.SDK_INT >= 26 && (picturePending || isInPictureInPictureMode());
+    }
+
+    private void requestPlayerPip() {
+        if (!supportsPip() || inPictureInPicture() || !playbackMode || !hasVideo || web == null) return;
+        android.app.PictureInPictureParams.Builder params = new android.app.PictureInPictureParams.Builder()
+                .setAspectRatio(new android.util.Rational(16, 9));
+        Rect source = new Rect();
+        if (web.getGlobalVisibleRect(source)) params.setSourceRectHint(source);
+        picturePending = true;
+        hidePlaybackBar();
+        setImmersiveLayers(false);
+        callJs("window.__ltv && window.__ltv.setPip(true)");
+        try {
+            if (enterPictureInPictureMode(params.build())) return;
+        } catch (IllegalStateException e) {
+            appLog.w("player", "画中画不可用：" + e.getMessage());
+        }
+        picturePending = false;
+        callJs("window.__ltv && window.__ltv.setPip(false)");
+        setImmersiveLayers(prefs.getBoolean(KEY_IMMERSIVE_PLAYER, true) && !webControlsMode);
+        toast("系统当前无法进入画中画");
+    }
+
+    @Override public void onPictureInPictureModeChanged(boolean active, android.content.res.Configuration config) {
+        super.onPictureInPictureModeChanged(active, config);
+        picturePending = false;
+        callJs("window.__ltv && window.__ltv.setPip(" + active + ")");
+        if (active) hidePlaybackBar();
+        setImmersiveLayers(!active && playbackMode && prefs.getBoolean(KEY_IMMERSIVE_PLAYER, true)
+                && !webControlsMode);
+    }
+
     /** 页面脚本用它上报全屏状态；只切 UI，不读取任何本地数据。 */
     private class LtvBridge {
         @JavascriptInterface
-        public void onFullscreen(final boolean on) {
-            runOnUiThread(new Runnable() {
+        public void playbackPanel(final String token, final boolean open) {
+            runBridge(token, () -> playbackPanelOpen = open);
+        }
+
+        @JavascriptInterface
+        public void requestPictureInPicture(final String token) {
+            runBridge(token, MainActivity.this::requestPlayerPip);
+        }
+
+        @JavascriptInterface
+        public void onFullscreen(final String token, final boolean on) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     String u = web != null ? web.getUrl() : null;
-                    if (u == null || currentUrl.isEmpty() || !u.startsWith(currentUrl)) {
-                        /* 之前这里静默 return —— 全屏明明是网页报的，却被丢掉之后
-                           原生层永远不进播放态，表现就是「全屏里什么都没有」。
-                           现在把丢弃原因写进日志，下次排障不用再猜。 */
-                        appLog.w("player", "全屏上报被丢弃 on=" + on + " url=" + u
-                                + " base=" + currentUrl);
-                        return;
-                    }
                     appLog.i("player", "网页上报全屏状态 " + on + " url=" + u);
                     applyPlaybackMode(on);
                 }
@@ -2652,8 +3338,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         /** 网页里那颗「✕ 退出全屏」被点击：走和原生按钮完全相同的退出流程。 */
         @JavascriptInterface
-        public void exitFullscreen() {
-            runOnUiThread(new Runnable() {
+        public void exitFullscreen(final String token) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     appLog.i("player", "网页内「退出全屏」被点击");
                     exitPlayback();
@@ -2669,8 +3355,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
          * 这里只负责发起 SSDP 搜索，进度与设备列表全部回写到网页面板。
          */
         @JavascriptInterface
-        public void cast() {
-            runOnUiThread(new Runnable() {
+        public void cast(final String token) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     appLog.i("cast", "网页内投屏入口被点击 / 重新搜索");
                     startCastDiscovery();
@@ -2680,13 +3366,14 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         /** cast() 的同义入口：个别 WebView 对短方法名有奇怪处理，留一个别名兜底。 */
         @JavascriptInterface
-        public void castStart() {
-            cast();
+        public void castStart(final String token) {
+            cast(token);
         }
 
-        /** 面板里点了某台设备：索引与 castDevices 一一对应。 */        @JavascriptInterface
-        public void castPick(final int index) {
-            runOnUiThread(new Runnable() {
+        /** 面板里点了某台设备：索引与 castDevices 一一对应。 */
+        @JavascriptInterface
+        public void castPick(final String token, final int index) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     if (index < 0 || index >= castDevices.size()) {
                         callJs("window.__ltv && window.__ltv.castStatus('设备已失效，请重新搜索')");
@@ -2698,43 +3385,43 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
 
         @JavascriptInterface
-        public void castStop() {
-            runOnUiThread(new Runnable() {
+        public void castStop(final String token) {
+            runBridge(token, new Runnable() {
                 @Override public void run() { stopCast(); }
             });
         }
 
         @JavascriptInterface
-        public void castSync() {
-            runOnUiThread(new Runnable() {
+        public void castSync(final String token) {
+            runBridge(token, new Runnable() {
                 @Override public void run() { syncCastProgress(); }
             });
         }
 
         /** 面板上的「暂停 / 继续」：true = 暂停，false = 继续。 */
         @JavascriptInterface
-        public void castPause(final boolean pause) {
-            runOnUiThread(new Runnable() {
+        public void castPause(final String token, final boolean pause) {
+            runBridge(token, new Runnable() {
                 @Override public void run() { pauseCast(pause); }
             });
         }
 
         /** 面板进度条松手：单位秒。JS 侧传字符串（input.value 天生是 string），这里解析。 */
         @JavascriptInterface
-        public void castSeek(final String seconds) {
+        public void castSeek(final String token, final String seconds) {
             double s = 0;
             try { s = Double.parseDouble(String.valueOf(seconds).trim()); }
             catch (Exception e) { s = 0; }
             final double sec = s;
-            runOnUiThread(new Runnable() {
+            runBridge(token, new Runnable() {
                 @Override public void run() { seekCast(sec); }
             });
         }
 
         /** 面板打开时轮询电视进度；关掉就停，别白白占用局域网。 */
         @JavascriptInterface
-        public void castPoll(final boolean on) {
-            runOnUiThread(new Runnable() {
+        public void castPoll(final String token, final boolean on) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     if (on) startCastPolling(); else stopCastPolling();
                 }
@@ -2742,8 +3429,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
 
         @JavascriptInterface
-        public void castSystem() {
-            runOnUiThread(new Runnable() {
+        public void castSystem(final String token) {
+            runBridge(token, new Runnable() {
                 @Override public void run() { openSystemCast(); }
             });
         }
@@ -2754,8 +3441,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
          * 同时负责起停进度轮询 —— 面板不在屏幕上时不必每 2 秒问一次电视。
          */
         @JavascriptInterface
-        public void castPanel(final boolean open) {
-            runOnUiThread(new Runnable() {
+        public void castPanel(final String token, final boolean open) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     castPanelOpen = open;
                     if (open) startCastPolling(); else stopCastPolling();
@@ -2765,8 +3452,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         /** 网页已自己绘制退出口与进度线，原生层据此不再重复显示。 */
         @JavascriptInterface
-        public void setDomUi(final boolean on) {
-            runOnUiThread(new Runnable() {
+        public void setDomUi(final String token, final boolean on) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     if (domUiActive == on) return;
                     domUiActive = on;
@@ -2780,17 +3467,21 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         /** 网页把关键判定结果写进日志中心，方便真机排障。 */
         @JavascriptInterface
-        public void log(final String msg) {
-            appLog.i("webview", msg == null ? "null" : msg);
+        public void log(final String token, final String msg) {
+            runBridge(token, () -> appLog.i("webview", msg == null ? "null" : msg));
         }
 
         /** 页面上出现/移除 <video>：决定是否显示常驻「全屏播放」按钮。 */
         @JavascriptInterface
-        public void onVideo(final boolean on) {
-            runOnUiThread(new Runnable() {
+        public void onVideo(final String token, final boolean on) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     hasVideo = on;
-                    if (!on) lastDuration = 0;
+                    if (!on) {
+                        lastDuration = 0;
+                        lastWatchBarSec = -1;
+                        if (watchStatusText != null) watchStatusText.setText("播放器已就绪");
+                    }
                     updateFabFullscreen();
                 }
             });
@@ -2798,11 +3489,23 @@ public class MainActivity extends Activity implements LocalServer.Callback {
 
         /** 网页 timeupdate 节流上报，驱动原生 SeekBar 与「当前/总时长」。 */
         @JavascriptInterface
-        public void onProgress(final double current, final double duration) {
-            runOnUiThread(new Runnable() {
+        public void onProgress(final String token, final double current, final double duration) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     lastDuration = duration;
                     lastCurrent = current;
+                    if (watchStatusText != null) {
+                        if (duration > 0 && current > 0) {
+                            int curSec = (int) Math.floor(current);
+                            if (curSec != lastWatchBarSec) {
+                                lastWatchBarSec = curSec;
+                                watchStatusText.setText("播放器已就绪 · " + fmtTime(current) + " / " + fmtTime(duration));
+                            }
+                        } else if (lastWatchBarSec != -1) {
+                            lastWatchBarSec = -1;
+                            watchStatusText.setText("播放器已就绪");
+                        }
+                    }
                     /* 重绘条件原来是 immersiveLayersOn —— 关掉沉浸播放后这条线虽然可见却
                        永远不重绘，画面里就是一片空白（用户反馈「看不到进度条」）。
                        改成跟着 playbackMode 走，并且顺手自愈一次可见性：
@@ -2828,29 +3531,17 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             });
         }
 
-        /** 投屏：网页拦截 hls.js / video.src 拿到 m3u8、mp4 直链后上报。 */
-        @JavascriptInterface
-        public void onStream(final String url) {
-            runOnUiThread(new Runnable() {
-                @Override public void run() {
-                    if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
-                        lastStreamUrl = url;
-                    }
-                }
-            });
-        }
-
         /** 自检脚本把搜索链路的诊断结果回传，只展示文本，不执行任何操作。 */
         @JavascriptInterface
-        public void onDiagnosis(final String text) {
-            runOnUiThread(new Runnable() {
+        public void onDiagnosis(final String token, final String text) {
+            runBridge(token, new Runnable() {
                 @Override public void run() {
                     appLog.i("diag", text);
-                    new android.app.AlertDialog.Builder(MainActivity.this)
+                    styleDarkDialog(new android.app.AlertDialog.Builder(MainActivity.this)
                             .setTitle("搜索链路自检")
                             .setMessage(text)
                             .setPositiveButton("关闭", null)
-                            .show();
+                            .show());
                 }
             });
         }
@@ -2861,11 +3552,10 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER);
         box.setPadding(dp(2), dp(6), dp(2), dp(5));
-        TypedValue tv = new TypedValue();
-        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, tv, true);
-        box.setBackgroundResource(tv.resourceId);
+        box.setBackground(rippleMask(12));
         box.setClickable(true);
         box.setFocusable(true);
+        attachSpringTouch(box);
         box.setOnClickListener(listener);
 
         ImageView icon = new ImageView(this);
@@ -2897,7 +3587,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         e.setTextSize(16);
         e.setTextColor(TEXT);
         e.setHintTextColor(TEXT_DIM);
-        e.setBackground(round(SURFACE2, 10));
+        e.setBackground(roundStroke(SURFACE2, 11, LINE_SOFT));
         e.setPadding(dp(14), dp(12), dp(14), dp(12));
         return e;
     }
@@ -2910,7 +3600,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         b.setAllCaps(false);
         b.setMinHeight(dp(48));
         b.setMinimumHeight(dp(48));
-        b.setBackground(round(ACCENT, 10));
+        b.setBackground(gradientRippleRound(ACCENT, ACCENT_BLUE, 11));
+        attachSpringTouch(b);
         b.setOnClickListener(listener);
         return b;
     }
@@ -2923,37 +3614,136 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         b.setAllCaps(false);
         b.setMinHeight(dp(44));
         b.setMinimumHeight(dp(44));
-        b.setBackgroundColor(Color.TRANSPARENT);
+        b.setBackground(rippleMask(10));
+        attachSpringTouch(b);
         b.setOnClickListener(listener);
         return b;
+    }
+
+    private Button secondaryPillButton(String label, View.OnClickListener listener) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setTextSize(14);
+        b.setTextColor(TEXT);
+        b.setAllCaps(false);
+        b.setMinHeight(dp(44));
+        b.setMinimumHeight(dp(44));
+        b.setPadding(dp(16), 0, dp(16), 0);
+        b.setBackground(rippleRound(SURFACE2, 11));
+        attachSpringTouch(b);
+        b.setOnClickListener(listener);
+        return b;
+    }
+
+    private Button sheetActionButton(String label, View.OnClickListener listener) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setTextSize(14);
+        b.setTextColor(TEXT);
+        b.setAllCaps(false);
+        b.setMinHeight(dp(46));
+        b.setMinimumHeight(dp(46));
+        b.setPadding(dp(14), dp(8), dp(14), dp(8));
+        b.setBackground(rippleRound(SURFACE2, 11));
+        attachSpringTouch(b);
+        b.setOnClickListener(listener);
+        return b;
+    }
+
+    private LinearLayout settingsCard(LinearLayout parent, String title) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(roundStroke(SURFACE, 15, BORDER_GLOW));
+        card.setPadding(dp(14), dp(12), dp(14), dp(14));
+        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        cardLp.bottomMargin = dp(12);
+        parent.addView(card, cardLp);
+
+        TextView head = new TextView(this);
+        head.setText(title);
+        head.setTextSize(12);
+        head.setTextColor(TEXT_DIM);
+        head.setPadding(dp(2), 0, dp(2), dp(8));
+        card.addView(head, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        return card;
+    }
+
+    private void styleCheckRow(CheckBox box) {
+        box.setTextColor(TEXT);
+        box.setButtonTintList(ColorStateList.valueOf(ACCENT));
+        box.setMinHeight(dp(44));
+        box.setPadding(dp(6), dp(6), dp(4), dp(6));
+    }
+
+    private LinearLayout.LayoutParams topMarginLp(int marginDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(marginDp);
+        return lp;
     }
 
     private void buildOverlay() {
         overlay = new LinearLayout(this);
         overlay.setOrientation(LinearLayout.VERTICAL);
         overlay.setGravity(Gravity.CENTER);
-        overlay.setBackgroundColor(BG);
+        overlay.setBackground(new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[] { 0xFF070B14, 0xFF0D1729, 0xFF0B101A }));
         overlay.setClickable(true);
-        overlay.setPadding(dp(24), dp(24), dp(24), dp(24));
+        overlay.setPadding(dp(20), dp(16), dp(20), dp(16));
         root.addView(overlay, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(round(SURFACE, 18));
-        card.setPadding(dp(22), dp(26), dp(22), dp(22));
-        overlay.addView(card, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        int cardW = Math.min(
+                getResources().getDisplayMetrics().widthPixels - dp(40),
+                dp(460));
+        overlay.addView(scroll, new LinearLayout.LayoutParams(
+                Math.max(dp(260), cardW),
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(roundStroke(SURFACE, 20, BORDER_GLOW));
+        card.setPadding(dp(22), dp(24), dp(22), dp(22));
+        scroll.addView(card, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout brandRow = new LinearLayout(this);
+        brandRow.setOrientation(LinearLayout.HORIZONTAL);
+        brandRow.setGravity(Gravity.CENTER);
+        brandRow.setPadding(0, 0, 0, dp(14));
+
+        ImageView iconView = new ImageView(this);
+        iconView.setImageResource(R.mipmap.ic_launcher);
+        iconView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        if (Build.VERSION.SDK_INT >= 21) {
+            iconView.setOutlineProvider(new android.view.ViewOutlineProvider() {
+                @Override public void getOutline(View view, android.graphics.Outline outline) {
+                    outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(12));
+                }
+            });
+            iconView.setClipToOutline(true);
+        }
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(42), dp(42));
+        iconLp.rightMargin = dp(10);
+        brandRow.addView(iconView, iconLp);
+
         TextView brand = new TextView(this);
-        brand.setText("▶  LibreTV");
-        brand.setTextSize(22);
+        brand.setText("LibreTV");
+        brand.setTextSize(23);
+        brand.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         brand.setTextColor(ACCENT);
-        brand.setGravity(Gravity.CENTER);
-        brand.setPadding(0, 0, 0, dp(14));
-        card.addView(brand);
+        brandRow.addView(brand);
+        card.addView(brandRow);
 
         overlayTitle = new TextView(this);
         overlayTitle.setTextSize(19);
@@ -2967,12 +3757,21 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         overlayHint.setTextSize(14);
         overlayHint.setTextColor(TEXT_DIM);
         overlayHint.setLineSpacing(dp(3), 1f);
-        overlayHint.setPadding(0, dp(12), 0, dp(18));
+        overlayHint.setPadding(0, dp(12), 0, dp(14));
         card.addView(overlayHint, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        overlayEdit = styledEdit(DEFAULT_EXTERNAL_URL);
+        overlayProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        overlayProgress.setMax(100);
+        overlayProgress.setProgressDrawable(auroraProgressDrawable(true));
+        overlayProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams progLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(6));
+        progLp.bottomMargin = dp(14);
+        card.addView(overlayProgress, progLp);
+
+        overlayEdit = styledEdit("https://");
         card.addView(overlayEdit, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -2986,13 +3785,15 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         pp.topMargin = dp(16);
         card.addView(overlayPrimary, pp);
 
-        overlaySecondary = textButton("重新导入内置源", new View.OnClickListener() {
+        overlaySecondary = secondaryPillButton("重新导入内置源", new View.OnClickListener() {
             @Override public void onClick(View v) { onSecondaryClick(); }
         });
+        overlaySecondary.setMinHeight(dp(48));
+        overlaySecondary.setMinimumHeight(dp(48));
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        sp.topMargin = dp(4);
+        sp.topMargin = dp(10);
         card.addView(overlaySecondary, sp);
     }
 
@@ -3008,210 +3809,141 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        ScrollView host = new ScrollView(this);
-        host.setBackground(round(SURFACE, 18));
-        host.setPadding(dp(20), dp(18), dp(20), dp(24));
-        host.setVisibility(View.GONE);
-        FrameLayout.LayoutParams hostLp = new FrameLayout.LayoutParams(
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setBackgroundColor(BG);
+        page.setClickable(true);
+        page.setFocusable(true);
+        page.setFocusableInTouchMode(true);
+        page.setVisibility(View.GONE);
+        root.addView(page, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
-        root.addView(host, hostLp);
-        sheetHost = host;
-
-        LinearLayout sheet = new LinearLayout(this);
-        sheet.setOrientation(LinearLayout.VERTICAL);
-        host.addView(sheet, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT));
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        sheetHost = page;
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        sheet.addView(header, new LinearLayout.LayoutParams(
+        header.setPadding(dp(20), dp(10), dp(14), dp(8));
+        page.addView(header, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
         TextView title = new TextView(this);
         title.setText("设置");
-        title.setTextSize(19);
+        title.setTextSize(22);
         title.setTextColor(TEXT);
-        header.addView(title, new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        title.setSingleLine(true);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        titleLp.rightMargin = dp(8);
+        header.addView(title, titleLp);
         TextView ver = new TextView(this);
         ver.setText("LibreTV " + versionLine());
         ver.setTextSize(12);
         ver.setTextColor(TEXT_DIM);
+        ver.setSingleLine(true);
+        ver.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        ver.setPadding(0, 0, dp(8), 0);
         header.addView(ver, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-        Button close = textButton("关闭", new View.OnClickListener() {
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        Button close = secondaryPillButton("关闭", new View.OnClickListener() {
             @Override public void onClick(View v) { hideSheet(); }
         });
+        close.setTextSize(13);
+        close.setMinHeight(dp(38));
+        close.setMinimumHeight(dp(38));
+        close.setPadding(dp(12), 0, dp(12), 0);
         header.addView(close);
 
-        localModeBox = new CheckBox(this);
-        localModeBox.setText("使用手机本地服务（不依赖电脑）");
-        localModeBox.setTextColor(TEXT);
-        localModeBox.setTextSize(14);
-        localModeBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        localModeBox.setChecked(localMode);
-        sheet.addView(localModeBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setBackground(roundStroke(SURFACE, 13, BORDER_GLOW));
+        tabs.setPadding(dp(4), dp(4), dp(4), dp(4));
+        LinearLayout.LayoutParams tabsLp = new LinearLayout.LayoutParams(-1, -2);
+        tabsLp.setMargins(dp(16), 0, dp(16), dp(10));
+        page.addView(tabs, tabsLp);
+        String[] labels = {"片源", "播放", "连接", "诊断"};
+        settingsSections = new LinearLayout[labels.length];
+        settingsTabs = new Button[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            final int tab = i;
+            Button button = textButton(labels[i], v -> selectSettingsSection(tab));
+            button.setMinWidth(0);
+            button.setMinimumWidth(0);
+            button.setMinHeight(dp(42));
+            button.setMinimumHeight(dp(42));
+            tabs.addView(button, new LinearLayout.LayoutParams(0, dp(42), 1f));
+            settingsTabs[i] = button;
+        }
 
-        // 投屏入口放在设置面板靠上的位置：用户找功能最先翻这里，
-        // 播放界面右下角的悬浮按钮在深色画面或小屏上容易被忽略。
-        TextView castEntry = new TextView(this);
-        castEntry.setText("投屏到电视（DLNA）");
-        castEntry.setTextColor(Color.WHITE);
-        castEntry.setTextSize(15);
-        castEntry.setGravity(Gravity.CENTER);
-        castEntry.setMinHeight(dp(52));
-        castEntry.setBackground(round(0xDD2FA36B, 14));
-        castEntry.setClickable(true);
-        castEntry.setFocusable(true);
-        castEntry.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { hideSheet(); showCastDialog(); }
-        });
-        LinearLayout.LayoutParams castEntryLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        castEntryLp.topMargin = dp(12);
-        castEntryLp.bottomMargin = dp(4);
-        sheet.addView(castEntry, castEntryLp);
+        settingsScroll = new ScrollView(this);
+        settingsScroll.setFillViewport(true);
+        page.addView(settingsScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        LinearLayout sections = new LinearLayout(this);
+        sections.setOrientation(LinearLayout.VERTICAL);
+        sections.setPadding(dp(16), dp(4), dp(16), dp(24));
+        settingsScroll.addView(sections, new FrameLayout.LayoutParams(-1, -2));
+        for (int i = 0; i < settingsSections.length; i++) {
+            LinearLayout section = new LinearLayout(this);
+            section.setOrientation(LinearLayout.VERTICAL);
+            sections.addView(section, new LinearLayout.LayoutParams(-1, -2));
+            settingsSections[i] = section;
+        }
+        LinearLayout sources = settingsSections[0];
+        LinearLayout player = settingsSections[1];
+        LinearLayout sheet = settingsSections[2];
+        LinearLayout diagnostics = settingsSections[3];
 
-        lanModeBox = new CheckBox(this);
-        lanModeBox.setText("允许同一 Wi-Fi 的其它设备访问本机服务");
-        lanModeBox.setTextColor(TEXT);
-        lanModeBox.setTextSize(13);
-        lanModeBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        lanModeBox.setChecked(lanMode);
-        sheet.addView(lanModeBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        TextView label = new TextView(this);
-        label.setText("外部服务地址（关闭本地服务时填写）");
-        label.setTextSize(13);
-        label.setTextColor(TEXT_DIM);
-        label.setPadding(0, dp(10), 0, dp(6));
-        sheet.addView(label);
-
-        settingsEdit = styledEdit(DEFAULT_EXTERNAL_URL);
-        sheet.addView(settingsEdit, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        portEdit = new EditText(this);
-        portEdit.setHint("本地端口");
-        portEdit.setSingleLine(true);
-        portEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
-        portEdit.setText(String.valueOf(localPort));
-        portEdit.setTextSize(15);
-        portEdit.setTextColor(TEXT);
-        portEdit.setHintTextColor(TEXT_DIM);
-        portEdit.setBackground(round(SURFACE2, 10));
-        portEdit.setPadding(dp(14), dp(12), dp(14), dp(12));
-
-        passwordEdit = new EditText(this);
-        passwordEdit.setHint("访问密码（留空=不校验）");
-        passwordEdit.setSingleLine(true);
-        passwordEdit.setInputType(InputType.TYPE_CLASS_TEXT
-                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        passwordEdit.setText(localPassword);
-        passwordEdit.setTextSize(15);
-        passwordEdit.setTextColor(TEXT);
-        passwordEdit.setHintTextColor(TEXT_DIM);
-        passwordEdit.setBackground(round(SURFACE2, 10));
-        passwordEdit.setPadding(dp(14), dp(12), dp(14), dp(12));
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        half.setMargins(0, dp(10), dp(6), 0);
-        row.addView(portEdit, half);
-        LinearLayout.LayoutParams half2 = new LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        half2.setMargins(dp(6), dp(10), 0, 0);
-        row.addView(passwordEdit, half2);
-        sheet.addView(row, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button save = primaryButton("保存并应用", new View.OnClickListener() {
-            @Override public void onClick(View v) { onSheetSave(); }
-        });
-        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        saveLp.topMargin = dp(12);
-        sheet.addView(save, saveLp);
-
-        Button diagnose = textButton("网络与搜索自检（查测活失败原因）", new View.OnClickListener() {
-            @Override public void onClick(View v) { runDiagnosis(); }
-        });
-        sheet.addView(diagnose, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button envProbe = textButton("运行环境体检（Node 错误码，查测活全失败）", new View.OnClickListener() {
-            @Override public void onClick(View v) { showEnvProbe(); }
-        });
-        sheet.addView(envProbe, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button reimport = textButton("重新导入内置源", new View.OnClickListener() {
-            @Override public void onClick(View v) { hideSheet(); injectPreset(true); }
-        });
-        sheet.addView(reimport, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        // 源被「连续失败自动停用」之后，网页端只有切到「已停用」筛选才露出逐个恢复按钮，
-        // 手机上基本找不到。这里给一个一键入口（含实时状态行），见 restoreAllSources()。
-        Button restoreAll = textButton("一键恢复所有源（解除自动停用）", new View.OnClickListener() {
-            @Override public void onClick(View v) { restoreAllSources(); }
-        });
-        sheet.addView(restoreAll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        restoreHint = new TextView(this);
-        restoreHint.setText("正在读取被自动停用的源…");
-        restoreHint.setTextSize(12);
-        restoreHint.setTextColor(TEXT_DIM);
-        restoreHint.setPadding(dp(4), 0, dp(4), dp(8));
-        sheet.addView(restoreHint, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        Button sourceMenu = textButton("源管理（导入 / 导出）", new View.OnClickListener() {
+        // ---- Tab 0: 片源
+        LinearLayout sourceManageCard = settingsCard(sources, "片源导入与订阅");
+        Button sourceMenu = primaryButton("导入或导出片源", new View.OnClickListener() {
             @Override public void onClick(View v) { showSourceMenu(); }
         });
-        sheet.addView(sourceMenu, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        sourceManageCard.addView(sourceMenu, new LinearLayout.LayoutParams(-1, -2));
+        sourceManageCard.addView(sheetActionButton("管理在线更新", v -> showOnlineSourceDialog()),
+                topMarginLp(8));
+        sourceManageCard.addView(sheetActionButton("重新导入内置源", new View.OnClickListener() {
+            @Override public void onClick(View v) { hideSheet(); injectPreset(true); }
+        }), topMarginLp(8));
 
-        Button logMenu = textButton("日志中心（查看 / 一键分享 / 保存）", new View.OnClickListener() {
-            @Override public void onClick(View v) { showLogCenter(); }
-        });
-        sheet.addView(logMenu, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        LinearLayout sourceHealthCard = settingsCard(sources, "健康度与异常恢复");
+        sourceHealthCard.addView(sheetActionButton("一键恢复所有源（解除自动停用）", new View.OnClickListener() {
+            @Override public void onClick(View v) { restoreAllSources(); }
+        }), new LinearLayout.LayoutParams(-1, -2));
+        restoreHint = new TextView(this);
+        restoreHint.setText("连接服务后可查看被停用的源");
+        restoreHint.setTextSize(12);
+        restoreHint.setTextColor(TEXT_DIM);
+        restoreHint.setPadding(dp(4), dp(8), dp(4), 0);
+        sourceHealthCard.addView(restoreHint, new LinearLayout.LayoutParams(-1, -2));
 
-        Button logBtn = textButton("查看本地服务日志", new View.OnClickListener() {
-            @Override public void onClick(View v) { showLog(); }
+        LinearLayout sourceStatCard = settingsCard(sources, "当前来源状态");
+        statLine = new TextView(this);
+        statLine.setTextSize(12);
+        statLine.setTextColor(TEXT_DIM);
+        statLine.setLineSpacing(dp(4), 1f);
+        sourceStatCard.addView(statLine);
+        updateStatLine();
+
+        // ---- Tab 1: 播放
+        LinearLayout playerDisplayCard = settingsCard(player, "画面与控制栏");
+        mobileCssBox = new CheckBox(this);
+        mobileCssBox.setText("移动端页面适配（播放器满宽、画面等比、防横向溢出）");
+        mobileCssBox.setTextSize(14);
+        styleCheckRow(mobileCssBox);
+        mobileCssBox.setChecked(prefs.getBoolean(KEY_MOBILE_CSS, true));
+        mobileCssBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
+                prefs.edit().putBoolean(KEY_MOBILE_CSS, checked).apply();
+                if (web != null) web.reload();
+            }
         });
-        sheet.addView(logBtn, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        playerDisplayCard.addView(mobileCssBox, new LinearLayout.LayoutParams(-1, -2));
 
         desktopBox = new CheckBox(this);
         desktopBox.setText("桌面模式（以电脑版页面显示）");
-        desktopBox.setTextColor(TEXT);
         desktopBox.setTextSize(14);
-        desktopBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
+        styleCheckRow(desktopBox);
         desktopBox.setChecked(prefs.getBoolean(KEY_DESKTOP, false));
         desktopBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
@@ -3220,51 +3952,28 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 if (web != null) web.reload();
             }
         });
-        sheet.addView(desktopBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        playerDisplayCard.addView(desktopBox, new LinearLayout.LayoutParams(-1, -2));
 
-        mobileCssBox = new CheckBox(this);
-        mobileCssBox.setText("移动端页面适配（播放器满宽、画面等比、防横向溢出）");
-        mobileCssBox.setTextColor(TEXT);
-        mobileCssBox.setTextSize(14);
-        mobileCssBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        mobileCssBox.setChecked(prefs.getBoolean(KEY_MOBILE_CSS, true));
-        mobileCssBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+        CheckBox fitBox = new CheckBox(this);
+        fitBox.setText("横屏铺满屏幕（会裁掉上下，竖屏始终完整）");
+        fitBox.setTextSize(14);
+        styleCheckRow(fitBox);
+        fitBox.setChecked(!"contain".equals(fitMode()));
+        fitBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
-                prefs.edit().putBoolean(KEY_MOBILE_CSS, checked).apply();
-                if (web != null) web.reload();
+                String m = checked ? "cover" : "contain";
+                prefs.edit().putString(KEY_FIT_MODE, m).apply();
+                callJs("window.__ltv && window.__ltv.setFit('" + m + "')");
+                toast(checked ? "横屏：铺满（上下会被裁掉）" : "画面：完整显示（有黑边，不裁切）");
+                appLog.i("player", "画面铺满开关：" + (checked ? "开" : "关"));
             }
         });
-        sheet.addView(mobileCssBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        landscapeBox = new CheckBox(this);
-        landscapeBox.setText("全屏播放时自动横屏");
-        landscapeBox.setTextColor(TEXT);
-        landscapeBox.setTextSize(14);
-        landscapeBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        landscapeBox.setChecked(prefs.getBoolean(KEY_AUTO_LANDSCAPE, true));
-        landscapeBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
-                prefs.edit().putBoolean(KEY_AUTO_LANDSCAPE, checked).apply();
-                if (playbackMode) {
-                    setRequestedOrientation(checked
-                            ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                            : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-                }
-            }
-        });
-        sheet.addView(landscapeBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        playerDisplayCard.addView(fitBox, new LinearLayout.LayoutParams(-1, -2));
 
         playbackBarBox = new CheckBox(this);
         playbackBarBox.setText("全屏时启用悬浮控制条（含可拖拽进度条）");
-        playbackBarBox.setTextColor(TEXT);
         playbackBarBox.setTextSize(14);
-        playbackBarBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
+        styleCheckRow(playbackBarBox);
         playbackBarBox.setChecked(prefs.getBoolean(KEY_PLAYBACK_BAR, true));
         playbackBarBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
@@ -3277,62 +3986,16 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                     playbackBar.animate().cancel();
                     playbackBar.setAlpha(1f);
                     playbackBar.setVisibility(View.GONE);
-                    // 关掉原生条时把网页栏还给页面，避免一个控制入口都没有
                     callJs("window.__ltv && window.__ltv.hideWebControls()");
                 }
             }
         });
-        sheet.addView(playbackBarBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        CheckBox immersiveBox = new CheckBox(this);
-        immersiveBox.setText("抖音式沉浸播放（无遮挡 / 单击暂停 / 滑动快进）");
-        immersiveBox.setTextColor(TEXT);
-        immersiveBox.setTextSize(14);
-        immersiveBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        immersiveBox.setChecked(prefs.getBoolean(KEY_IMMERSIVE_PLAYER, true));
-        immersiveBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
-                prefs.edit().putBoolean(KEY_IMMERSIVE_PLAYER, checked).apply();
-                appLog.i("player", "沉浸播放开关：" + (checked ? "开" : "关（经典控制条）"));
-                if (!playbackMode) return;
-                hideAdvancedPanel();
-                setImmersiveLayers(checked);
-                if (checked) toast("已切到沉浸播放：单击暂停 / 左右滑快进 / 右上 ⋯ 更多");
-                else showPlaybackBarTemporarily();
-            }
-        });
-        sheet.addView(immersiveBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        CheckBox fitBox = new CheckBox(this);
-        /* 默认不勾：完整显示画面。勾上才会在横屏用 cover 铺满，代价是画面上下被裁掉
-           （16:9 的视频在 20:9 的屏幕上必然如此）。 */
-        fitBox.setText("横屏铺满屏幕（会裁掉上下，竖屏始终完整）");
-        fitBox.setTextColor(TEXT);
-        fitBox.setTextSize(14);
-        fitBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
-        fitBox.setChecked(!"contain".equals(fitMode()));
-        fitBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
-                String m = checked ? "cover" : "contain";
-                prefs.edit().putString(KEY_FIT_MODE, m).apply();
-                callJs("window.__ltv && window.__ltv.setFit('" + m + "')");
-                toast(checked ? "横屏：铺满（上下会被裁掉）" : "画面：完整显示（有黑边，不裁切）");
-                appLog.i("player", "画面铺满开关：" + (checked ? "开" : "关"));
-            }
-        });
-        sheet.addView(fitBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        playerDisplayCard.addView(playbackBarBox, new LinearLayout.LayoutParams(-1, -2));
 
         CheckBox autoHideBox = new CheckBox(this);
         autoHideBox.setText("控制条自动隐藏（关闭则常驻）");
-        autoHideBox.setTextColor(TEXT);
         autoHideBox.setTextSize(14);
-        autoHideBox.setButtonTintList(ColorStateList.valueOf(ACCENT));
+        styleCheckRow(autoHideBox);
         autoHideBox.setChecked(prefs.getBoolean(KEY_CONTROL_AUTOHIDE, true));
         autoHideBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
             @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
@@ -3347,50 +4010,185 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 }
             }
         });
-        sheet.addView(autoHideBox, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
+        playerDisplayCard.addView(autoHideBox, new LinearLayout.LayoutParams(-1, -2));
 
+        LinearLayout playerImmersiveCard = settingsCard(player, "全屏与浏览栏");
+        landscapeBox = new CheckBox(this);
+        landscapeBox.setText("全屏播放时自动横屏");
+        landscapeBox.setTextSize(14);
+        styleCheckRow(landscapeBox);
+        landscapeBox.setChecked(prefs.getBoolean(KEY_AUTO_LANDSCAPE, true));
+        landscapeBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
+                prefs.edit().putBoolean(KEY_AUTO_LANDSCAPE, checked).apply();
+                if (playbackMode) {
+                    setRequestedOrientation(checked
+                            ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                            : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                }
+            }
+        });
+        playerImmersiveCard.addView(landscapeBox, new LinearLayout.LayoutParams(-1, -2));
+
+        CheckBox immersiveBox = new CheckBox(this);
+        immersiveBox.setText("抖音式沉浸播放（无遮挡 / 单击暂停 / 滑动快进）");
+        immersiveBox.setTextSize(14);
+        styleCheckRow(immersiveBox);
+        immersiveBox.setChecked(prefs.getBoolean(KEY_IMMERSIVE_PLAYER, true));
+        immersiveBox.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(android.widget.CompoundButton b, boolean checked) {
+                prefs.edit().putBoolean(KEY_IMMERSIVE_PLAYER, checked).apply();
+                appLog.i("player", "沉浸播放开关：" + (checked ? "开" : "关（经典控制条）"));
+                if (!playbackMode) return;
+                hideAdvancedPanel();
+                setImmersiveLayers(checked);
+                if (checked) toast("已切到沉浸播放：单击暂停 / 左右滑快进 / 右上 ⋯ 更多");
+                else showPlaybackBarTemporarily();
+            }
+        });
+        playerImmersiveCard.addView(immersiveBox, new LinearLayout.LayoutParams(-1, -2));
+
+        playerImmersiveCard.addView(sheetActionButton("隐藏浏览导航栏", v -> {
+            hideSheet();
+            applyImmersive(true);
+        }), topMarginLp(6));
+
+        // ---- Tab 2: 连接
+        LinearLayout serverStatCard = settingsCard(sheet, "服务运行状态");
         serverStatLine = new TextView(this);
         serverStatLine.setTextSize(12);
         serverStatLine.setTextColor(ACCENT);
-        serverStatLine.setPadding(0, dp(12), 0, 0);
-        serverStatLine.setLineSpacing(dp(3), 1f);
-        sheet.addView(serverStatLine);
+        serverStatLine.setLineSpacing(dp(4), 1f);
+        serverStatCard.addView(serverStatLine);
         updateServerStat();
 
-        statLine = new TextView(this);
-        statLine.setTextSize(12);
-        statLine.setTextColor(TEXT_DIM);
-        statLine.setPadding(0, dp(8), 0, 0);
-        statLine.setLineSpacing(dp(3), 1f);
-        sheet.addView(statLine);
-        updateStatLine();
+        LinearLayout serverConfigCard = settingsCard(sheet, "服务模式与参数");
+        localModeBox = new CheckBox(this);
+        localModeBox.setText("使用手机本地服务");
+        localModeBox.setTextSize(14);
+        styleCheckRow(localModeBox);
+        localModeBox.setChecked(localMode);
+        serverConfigCard.addView(localModeBox, new LinearLayout.LayoutParams(-1, -2));
+
+        lanModeBox = new CheckBox(this);
+        lanModeBox.setText("允许同一 Wi-Fi 的其它设备访问本机服务");
+        lanModeBox.setTextSize(13);
+        styleCheckRow(lanModeBox);
+        lanModeBox.setChecked(lanMode);
+        serverConfigCard.addView(lanModeBox, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView label = new TextView(this);
+        label.setText("外部服务地址");
+        label.setTextSize(13);
+        label.setTextColor(TEXT_DIM);
+        label.setPadding(0, dp(8), 0, dp(6));
+        serverConfigCard.addView(label);
+
+        settingsEdit = styledEdit("https://");
+        serverConfigCard.addView(settingsEdit, new LinearLayout.LayoutParams(-1, -2));
+
+        portEdit = new EditText(this);
+        portEdit.setHint("本地端口");
+        portEdit.setSingleLine(true);
+        portEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        portEdit.setText(String.valueOf(localPort));
+        portEdit.setTextSize(15);
+        portEdit.setTextColor(TEXT);
+        portEdit.setHintTextColor(TEXT_DIM);
+        portEdit.setBackground(roundStroke(SURFACE2, 11, LINE_SOFT));
+        portEdit.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        passwordEdit = new EditText(this);
+        passwordEdit.setHint("访问密码（留空时自动生成）");
+        passwordEdit.setSingleLine(true);
+        passwordEdit.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordEdit.setText(localPassword);
+        passwordEdit.setTextSize(15);
+        passwordEdit.setTextColor(TEXT);
+        passwordEdit.setHintTextColor(TEXT_DIM);
+        passwordEdit.setBackground(roundStroke(SURFACE2, 11, LINE_SOFT));
+        passwordEdit.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.addView(portEdit, topMarginLp(8));
+        row.addView(passwordEdit, topMarginLp(10));
+        serverConfigCard.addView(row, new LinearLayout.LayoutParams(-1, -2));
+
+        localModeBox.setOnCheckedChangeListener((button, checked) -> {
+            label.setVisibility(checked ? View.GONE : View.VISIBLE);
+            settingsEdit.setVisibility(checked ? View.GONE : View.VISIBLE);
+            lanModeBox.setVisibility(checked ? View.VISIBLE : View.GONE);
+            row.setVisibility(checked ? View.VISIBLE : View.GONE);
+        });
+        label.setVisibility(localMode ? View.GONE : View.VISIBLE);
+        settingsEdit.setVisibility(localMode ? View.GONE : View.VISIBLE);
+        lanModeBox.setVisibility(localMode ? View.VISIBLE : View.GONE);
+        row.setVisibility(localMode ? View.VISIBLE : View.GONE);
+
+        Button save = primaryButton("保存并应用", new View.OnClickListener() {
+            @Override public void onClick(View v) { onSheetSave(); }
+        });
+        serverConfigCard.addView(save, topMarginLp(14));
+
+        // ---- Tab 3: 诊断
+        LinearLayout diagCheckCard = settingsCard(diagnostics, "网络与服务排障");
+        diagCheckCard.addView(sheetActionButton("网络与搜索自检（查测活失败原因）", new View.OnClickListener() {
+            @Override public void onClick(View v) { runDiagnosis(); }
+        }), new LinearLayout.LayoutParams(-1, -2));
+        diagCheckCard.addView(sheetActionButton("运行环境体检（查 Node 错误码 / 测活）", new View.OnClickListener() {
+            @Override public void onClick(View v) { showEnvProbe(); }
+        }), topMarginLp(8));
+        diagCheckCard.addView(sheetActionButton("刷新当前页面", v -> {
+            hideSheet();
+            if (!currentUrl.isEmpty()) web.reload();
+        }), topMarginLp(8));
+
+        LinearLayout diagLogCard = settingsCard(diagnostics, "日志与导出");
+        diagLogCard.addView(sheetActionButton("日志中心（查看 / 一键分享 / 保存）", new View.OnClickListener() {
+            @Override public void onClick(View v) { showLogCenter(); }
+        }), new LinearLayout.LayoutParams(-1, -2));
+        diagLogCard.addView(sheetActionButton("查看本地服务日志", new View.OnClickListener() {
+            @Override public void onClick(View v) { showLog(); }
+        }), topMarginLp(8));
+
+        selectSettingsSection(0);
     }
 
     /** 设置面板统一提交：模式、端口、密码、局域网共享一次性生效。 */
     private void onSheetSave() {
         boolean useLocal = localModeBox.isChecked();
+        if (!useLocal) {
+            String url = validateExternalAddress(settingsEdit);
+            if (url == null) return;
+            localMode = false;
+            stopLocalService();
+            prefs.edit().putBoolean(KEY_LOCAL_MODE, false).apply();
+            hideSheet();
+            if (!url.equals(currentUrl) || overlayVisible()) saveAndLoad(url);
+            updateServerStat();
+            return;
+        }
         int port;
         try {
             port = Integer.parseInt(portEdit.getText().toString().trim());
         } catch (NumberFormatException e) {
-            toast("端口必须是数字");
-            return;
+            port = -1;
         }
         if (port < 1024 || port > 65535) {
-            toast("端口需在 1024~65535 之间");
+            portEdit.setError("请输入 1024～65535 之间的端口");
+            portEdit.requestFocus();
             return;
         }
         String pw = passwordEdit.getText().toString();
         boolean lan = lanModeBox.isChecked();
-
-        // 空密码 = 不校验：只监听 127.0.0.1 时没问题，但开启局域网共享就等于把
-        // 一个无鉴权的服务暴露给整个网段，这里直接挡住，避免默认配置被误开成公用服务。
         if (lan && pw.trim().isEmpty()) {
-            toast("开启局域网共享前，请先设置访问密码（默认的随机密码只有本机知道）");
+            passwordEdit.setError("开启局域网共享前，请设置访问密码");
+            passwordEdit.requestFocus();
             return;
         }
+        boolean changed = !localMode || port != localPort || lan != lanMode || !pw.equals(localPassword);
 
         prefs.edit()
                 .putBoolean(KEY_LOCAL_MODE, useLocal)
@@ -3406,28 +4204,41 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         hideSheet();
         updateServerStat();
 
-        if (localMode) {
-            restartLocal();
+        if (changed) restartLocal();
+        else if (localServer() == null || !localServer().isRunning()) startLocalService();
+    }
+
+    private String validateExternalAddress(EditText field) {
+        String input = field.getText().toString().trim();
+        if (!input.isEmpty() && !input.contains("://")) input = "https://" + input;
+        String url = normalize(input);
+        if (url == null) {
+            field.setError("请输入有效的服务地址");
+        } else if (Build.VERSION.SDK_INT >= 24 && "http".equalsIgnoreCase(Uri.parse(url).getScheme())
+                && !android.security.NetworkSecurityPolicy.getInstance()
+                        .isCleartextTrafficPermitted(Uri.parse(url).getHost())) {
+            field.setError("此外部服务需使用 HTTPS");
         } else {
-            localServer.stop();
-            String u = normalize(settingsEdit.getText().toString());
-            if (u == null) {
-                toast("外部地址无效，例如 192.168.1.100:8899");
-                return;
-            }
-            saveAndLoad(u);
+            return url;
         }
+        field.requestFocus();
+        return null;
     }
 
     private void updateStatLine() {
         if (statLine == null) return;
-        statLine.setText("服务端预置源："
-                + (serverEnvSourceCount < 0 ? "探测中…" : serverEnvSourceCount + " 条")
-                + "（页面自动勾选，不依赖浏览器存储）\n"
-                + "APK 内置源 " + presetCount + " 条 · 直播 " + presetLiveCount
-                + " 条 · 网页本地源 " + (pageSourceCount < 0 ? "读取中…" : pageSourceCount + " 条")
-                + " · 客户端 " + appVersion() + "\n"
-                + "当前服务：" + (currentUrl.isEmpty() ? "未连接" : currentUrl));
+        boolean connected = !currentUrl.isEmpty();
+        String envDesc = serverEnvSourceCount >= 0
+                ? serverEnvSourceCount + " 条（自动勾选）"
+                : (connected ? "探测中…" : "未连接");
+        String pageDesc = pageSourceCount >= 0
+                ? pageSourceCount + " 条"
+                : (connected ? "读取中…" : "未连接");
+        statLine.setText("服务端预置源：" + envDesc + "\n"
+                + "APK 内置点播 " + presetCount + " 条 · 直播 " + presetLiveCount
+                + " 条 · 网页本地源 " + pageDesc + "\n"
+                + "当前服务：" + (connected ? currentUrl : "未连接")
+                + " · 客户端 " + appVersion());
     }
 
     /** 在网页里跑一次真实搜索，把 401 / 无源 / 出网失败 直接显示出来。 */
@@ -3445,6 +4256,60 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     // ---------------------------------------------------------------- 面板显隐
 
     private void showSheet() {
+        showSheet(0);
+    }
+
+    private void hideSheetIme() {
+        if (currentSettingsTab == 2 || sheetHost == null) return;
+        android.view.inputmethod.InputMethodManager imm =
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) imm.hideSoftInputFromWindow(sheetHost.getWindowToken(), 0);
+    }
+
+    private void selectSettingsSection(int index) {
+        currentSettingsTab = index;
+        if (index != 2 && sheetHost != null) {
+            if (settingsEdit != null) settingsEdit.clearFocus();
+            if (portEdit != null) portEdit.clearFocus();
+            if (passwordEdit != null) passwordEdit.clearFocus();
+            sheetHost.requestFocus();
+            hideSheetIme();
+            sheetHost.postDelayed(this::hideSheetIme, 180);
+            sheetHost.postDelayed(this::hideSheetIme, 450);
+        }
+        for (int i = 0; i < settingsSections.length; i++) {
+            boolean active = i == index;
+            LinearLayout sec = settingsSections[i];
+            if (active) {
+                sec.animate().cancel();
+                sec.setVisibility(View.VISIBLE);
+                sec.setAlpha(1f);
+                if (sheetShowing) {
+                    int n = sec.getChildCount();
+                    for (int c = 0; c < n; c++) {
+                        View card = sec.getChildAt(c);
+                        card.animate().cancel();
+                        card.setAlpha(0.45f);
+                        card.setTranslationY(dp(6));
+                        card.animate().alpha(1f).translationY(0f)
+                                .setStartDelay(c * 25L)
+                                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                                .setDuration(160).start();
+                    }
+                }
+            } else {
+                sec.setVisibility(View.GONE);
+            }
+            Button button = settingsTabs[i];
+            button.setSelected(active);
+            button.setTextColor(active ? Color.WHITE : TEXT_DIM);
+            button.setBackground(active ? gradientRippleRound(ACCENT, ACCENT_BLUE, 10) : rippleMask(10));
+        }
+        settingsScroll.scrollTo(0, 0);
+    }
+
+    private void showSheet(int tab) {
+        sheetShowing = true;
         settingsEdit.setText(prefs.getString(KEY_URL, DEFAULT_EXTERNAL_URL));
         portEdit.setText(String.valueOf(localPort));
         passwordEdit.setText(localPassword);
@@ -3452,32 +4317,64 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         lanModeBox.setChecked(lanMode);
         updateStatLine();
         updateServerStat();
-        refreshSourceCount();
-        refreshDisabledSources();
+        if (!currentUrl.isEmpty()) {
+            refreshSourceCount();
+            refreshDisabledSources();
+        } else if (restoreHint != null) {
+            restoreHint.setText("连接服务后可查看被停用的源");
+        }
+        selectSettingsSection(tab);
+        scrim.animate().cancel();
         scrim.setVisibility(View.VISIBLE);
+        scrim.setAlpha(0f);
+        scrim.bringToFront();
+        scrim.animate().alpha(1f).setDuration(170).start();
+
+        sheetHost.animate().cancel();
         sheetHost.setVisibility(View.VISIBLE);
-        sheetHost.setTranslationY(dp(320));
-        sheetHost.animate().translationY(0).setDuration(220).start();
+        sheetHost.setAlpha(0f);
+        sheetHost.setTranslationY(dp(16));
+        sheetHost.bringToFront();
+        sheetHost.animate().alpha(1f).translationY(0f)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .setDuration(180).start();
+
+        mainBox.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        updateBottomBarVisibility();
+        updateFabFullscreen();
     }
 
     private void hideSheet() {
-        if (sheetHost.getVisibility() != View.VISIBLE) return;
-        sheetHost.animate().translationY(dp(320)).setDuration(180)
-                .withEndAction(new Runnable() {
-                    @Override public void run() {
-                        sheetHost.setVisibility(View.GONE);
-                        scrim.setVisibility(View.GONE);
-                    }
-                }).start();
+        if (!sheetVisible()) return;
+        sheetShowing = false;
+        ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                .hideSoftInputFromWindow(sheetHost.getWindowToken(), 0);
+        mainBox.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        updateBottomBarVisibility();
+        updateFabFullscreen();
+
+        scrim.animate().cancel();
+        scrim.animate().alpha(0f).setDuration(140).withEndAction(() -> {
+            if (!sheetShowing) scrim.setVisibility(View.GONE);
+        }).start();
+
+        sheetHost.animate().cancel();
+        sheetHost.animate().alpha(0f).translationY(dp(12)).setDuration(140).withEndAction(() -> {
+            if (!sheetShowing) {
+                sheetHost.setVisibility(View.GONE);
+                sheetHost.setAlpha(1f);
+                sheetHost.setTranslationY(0f);
+            }
+        }).start();
     }
 
     private boolean sheetVisible() {
-        return sheetHost != null && sheetHost.getVisibility() == View.VISIBLE;
+        return sheetHost != null && sheetShowing;
     }
 
     private void applyImmersive(boolean on) {
         immersive = on;
-        bottomBar.setVisibility((on || playbackMode) ? View.GONE : View.VISIBLE);
+        updateBottomBarVisibility();
         fabRestore.setVisibility((on && !playbackMode) ? View.VISIBLE : View.GONE);
         if (on) toast("沉浸模式：点右下角或按返回键恢复工具栏");
         syncSystemUi();
@@ -3491,50 +4388,74 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         showCard(title, hint, url, "连接并保存", "重新导入内置源");
     }
 
-    private void showError(String description, String failingUrl) {
+    private void showError(String description) {
         overlayMode = 2;
-        showCard("连接失败",
-                "地址：" + failingUrl + "\n错误：" + description + "\n\n"
-                        + "请依次检查：\n"
-                        + "1  手机与电脑在同一 Wi-Fi\n"
-                        + "2  服务端绑定 0.0.0.0（.env.local 的 LIBRETV_HOST）\n"
-                        + "3  服务已启动、防火墙未拦截\n"
-                        + "4  端口是否正确（默认 8899）",
+        String hint = localMode ? "先重试页面。持续失败时可在连接设置里查看本地服务状态。"
+                : "请确认外部服务已启动、地址及 HTTPS 证书有效。";
+        showCard(localMode ? "本地页面加载失败" : "连接失败",
+                description + "\n\n" + hint,
                 currentUrl.isEmpty() ? DEFAULT_URL : currentUrl,
-                "重试连接", "用原地址重试");
+                "重试连接", "连接设置");
     }
 
     private void showCard(String title, String hint, String url,
                           String primary, String secondary) {
+        overlayShowing = true;
         overlayTitle.setText(title);
         overlayHint.setText(hint);
+        if (overlayProgress != null) {
+            overlayProgress.setVisibility(overlayMode == 4 ? View.VISIBLE : View.GONE);
+            if (overlayMode == 4) overlayProgress.setProgress(8);
+        }
         overlayEdit.setText(url);
         overlayPrimary.setText(primary);
         overlaySecondary.setText(secondary);
+        overlay.animate().cancel();
         overlay.setVisibility(View.VISIBLE);
+        overlay.setAlpha(0f);
+        overlay.setScaleX(0.96f);
+        overlay.setScaleY(0.96f);
         overlay.bringToFront();
+        overlay.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                .setInterpolator(new android.view.animation.DecelerateInterpolator())
+                .setDuration(160).start();
         progress.setVisibility(View.GONE);
+        updateBottomBarVisibility();
+        updateFabFullscreen();
     }
 
     private void hideOverlay() {
-        overlay.setVisibility(View.GONE);
+        overlayShowing = false;
+        updateBottomBarVisibility();
+        updateFabFullscreen();
+        if (overlay == null || overlay.getVisibility() != View.VISIBLE) return;
+        overlay.animate().cancel();
+        overlay.animate().alpha(0f).scaleX(0.97f).scaleY(0.97f).setDuration(130)
+                .withEndAction(() -> {
+                    if (!overlayShowing) {
+                        overlay.setVisibility(View.GONE);
+                        overlay.setAlpha(1f);
+                        overlay.setScaleX(1f);
+                        overlay.setScaleY(1f);
+                    }
+                }).start();
     }
 
     private boolean overlayVisible() {
-        return overlay != null && overlay.getVisibility() == View.VISIBLE;
+        return overlay != null && overlayShowing;
     }
 
     private void onPrimaryClick() {
         if (localMode) {
-            if (overlayMode == 3 || overlayMode == 5) switchToExternal();
+            if (overlayMode == 2 && localServer() != null && localServer().isRunning()) {
+                hideOverlay();
+                web.reload();
+            } else if (overlayMode == 3 || overlayMode == 5) switchToExternal();
             else restartLocal();
             return;
         }
-        String u = normalize(overlayEdit.getText().toString());
-        if (u == null) {
-            toast("地址无效，例如 192.168.1.100:8899");
-            return;
-        }
+        String u = validateExternalAddress(overlayEdit);
+        if (u == null) return;
         saveAndLoad(u);
     }
 
@@ -3551,10 +4472,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             return;
         }
         if (overlayMode == 2) {
-            if (!currentUrl.isEmpty()) {
-                hideOverlay();
-                load(currentUrl);
-            }
+            showSheet(2);
             return;
         }
         injectPreset(true);
@@ -3603,14 +4521,16 @@ public class MainActivity extends Activity implements LocalServer.Callback {
      */
     private void maybeInjectPreset(String url, boolean force) {
         if (presetJson.isEmpty() || injectTemplate.isEmpty() || web == null) return;
-        if (!force && (currentUrl.isEmpty() || !url.startsWith(currentUrl))) return;
+        if (!force && !sameWebOrigin(url, currentUrl)) return;
+        // 服务端探测尚未结束时先等待，探测回调结束后再按真实 defaultSources 数量分流，避免重复注入。
+        if (!force && serverEnvSourceCount < 0) return;
         // 服务端已下发预置源时，页面会自动勾选 env_*；再往 localStorage 注入一份
         // 会变成 47+47 条重复，/api/search 的 slice(0,50) 反而把可用源挤掉。
-        if (!force && serverEnvSourceCount > 0) {
+        if (serverEnvSourceCount > 0) {
             // 点播源由服务端下发即可，但仍要把直播订阅带进去
             web.postDelayed(new Runnable() {
-                @Override public void run() { injectLiveOnly(); }
-            }, 700);
+                @Override public void run() { injectLiveOnly(force); }
+            }, force ? 0 : 700);
             return;
         }
         web.postDelayed(new Runnable() {
@@ -3619,7 +4539,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     /** 服务端已有预置点播源时，只合并直播订阅，避免点播源重复。 */
-    private void injectLiveOnly() {
+    private void injectLiveOnly(final boolean notify) {
         if (web == null || presetJson.isEmpty() || injectTemplate.isEmpty()) return;
         try {
             JSONObject trimmed = new JSONObject(presetJson);
@@ -3627,7 +4547,18 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             st.put("customAPIs", new org.json.JSONArray());
             st.put("selectedKeys", new org.json.JSONArray());
             web.evaluateJavascript(injectTemplate.replace(
-                    "__PRESET__", JSONObject.quote(trimmed.toString())), null);
+                    "__PRESET__", JSONObject.quote(trimmed.toString())), new ValueCallback<String>() {
+                @Override public void onReceiveValue(String value) {
+                    if (notify) {
+                        toast("已使用服务端预置源（" + serverEnvSourceCount + " 条），并同步直播订阅");
+                    }
+                    if (web != null) {
+                        web.postDelayed(new Runnable() {
+                            @Override public void run() { refreshSourceCount(); }
+                        }, 800);
+                    }
+                }
+            });
         } catch (Exception ignored) {
             // 快照结构变化时静默跳过，点播源仍由服务端提供
         }
@@ -3664,12 +4595,17 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 } finally {
                     if (c != null) c.disconnect();
                 }
+                if (!base.equals(currentUrl)) return;
                 serverEnvSourceCount = n;
                 final int result = n;
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
+                        if (!base.equals(currentUrl)) return;
                         updateStatLine();
-                        if (result == 0 && web != null) injectPreset(false);
+                        if (web != null && !readyPageUrl.isEmpty() && sameWebOrigin(readyPageUrl, base)) {
+                            if (result > 0) injectLiveOnly(false);
+                            else injectPreset(false);
+                        }
                     }
                 });
             }
@@ -3691,12 +4627,26 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             toast("未找到内置源配置");
             return;
         }
+        if (force && serverEnvSourceCount > 0) {
+            injectLiveOnly(true);
+            return;
+        }
         injecting = true;
         String js = injectTemplate.replace("__PRESET__", JSONObject.quote(presetJson));
         web.evaluateJavascript(js, new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
                 injecting = false;
-                String v = value == null ? "" : value.replace("\"", "");
+                String v = jsString(value);
+                if (v == null) v = "";
+                if ("skip".equals(v)) {
+                    if (force) toast("内置源已是最新（" + presetCount + " 条）");
+                    if (web != null) {
+                        web.postDelayed(new Runnable() {
+                            @Override public void run() { refreshSourceCount(); }
+                        }, 800);
+                    }
+                    return;
+                }
                 if (!v.startsWith("ok")) {
                     appLog.w("sources", "内置源注入失败：" + v);
                     toast("内置源导入失败：" + v);
@@ -3893,14 +4843,14 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         }
 
         // 页面脚本通过它上报全屏状态；方法内会校验当前页面必须属于配置的服务地址
-        web.addJavascriptInterface(new LtvBridge(), "LtvBridge");
+        web.addJavascriptInterface(new LtvBridge(), "LtvBridgeNative");
 
         // 全屏播放时轻触画面唤出控制条。返回 false 不消费事件，网页自己的
         // 点击（播放/暂停）照常生效。切到「网页控制栏」时不打扰网页栏上的操作，
         // 用户按返回键即可切回原生控制条。
         web.setOnTouchListener(new View.OnTouchListener() {
             @Override public boolean onTouch(View v, MotionEvent e) {
-                if (!playbackMode || webControlsMode || immersiveLayersOn) return false;
+                if (!playbackMode || webControlsMode || immersiveLayersOn || castPanelOpen || playbackPanelOpen) return false;
                 if (e.getAction() == MotionEvent.ACTION_DOWN) {
                     touchDownX = e.getX();
                     touchDownY = e.getY();
@@ -3935,11 +4885,47 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             }
 
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                bridgeToken = null;
+                readyPageUrl = "";
+                playbackPanelOpen = false;
+                castPanelOpen = false;
+                hasVideo = false;
+                lastCurrent = 0;
+                lastDuration = 0;
+                lastWatchBarSec = -1;
+                if (watchStatusText != null) watchStatusText.setText("播放器已就绪");
+                updateBottomNavState(url);
+                if (playbackMode && customView == null && !inPictureInPicture()) applyPlaybackMode(false);
+                else updateFabFullscreen();
+                lastFinishedUrl = "";
+                super.onPageStarted(view, url, favicon);
+            }
+
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                super.doUpdateVisitedHistory(view, url, isReload);
+                updateBottomNavState(url);
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, android.webkit.SslErrorHandler handler,
+                                           android.net.http.SslError error) {
+                handler.cancel();
+                int code = error == null ? -1 : error.getPrimaryError();
+                String errUrl = error == null ? null : error.getUrl();
+                appLog.w("webview", "已拒绝证书无效的 HTTPS 连接，错误码 " + code);
+                if (errUrl != null && sameWebOrigin(errUrl, currentUrl)) {
+                    runOnUiThread(() -> showError("HTTPS 证书校验失败（错误码 " + code + "）"));
+                }
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 // 放宽为「同 origin 即可」：密码页 / 重定向后 view.getUrl() 可能与 url 不一致，
                 // 严格相等会让注入被跳过，源就补不回来。
-                if (url == null || currentUrl.isEmpty() || !url.startsWith(currentUrl)) return;
+                if (!sameWebOrigin(url, currentUrl) || !sameWebOrigin(view.getUrl(), currentUrl)) return;
                 /* WebView 对同一次导航会回调多次 onPageFinished（主框架 + 子框架 / 内部重定向），
                    日志里能看到同一 URL 相隔 13ms 连报两三次。每报一次就把整条注入链
                    （自动登录 + 源合并 + 移动端样式 + 播放增强）重跑一遍，其中源合并要
@@ -3949,24 +4935,36 @@ public class MainActivity extends Activity implements LocalServer.Callback {
                 if (url.equals(lastFinishedUrl) && now - lastFinishedAt < 1200) return;
                 lastFinishedUrl = url;
                 lastFinishedAt = now;
+                readyPageUrl = url;
+                updateBottomNavState(url);
 
                 appLog.i("page", "页面加载完成 " + url);
-                // 未登录时 /api/search 直接 401，界面表现为「搜不到视频」；这里自动完成校验
-                if (!autoLoginTemplate.isEmpty() && web != null) {
-                    web.evaluateJavascript(autoLoginTemplate.replace(
-                            "__PASSWORD__", JSONObject.quote(effectivePassword)), null);
+                // 原生桥对所有已校验的当前服务 origin 生效（本地模式与外部模式通用）
+                bridgeToken = randomPassword();
+                web.evaluateJavascript(onOrigin(url, bridgeSetup(bridgeToken)), null);
+                // 未登录时 /api/search 直接 401，界面表现为「搜不到视频」；自动登录仅限本机服务
+                if (isLocalWebOrigin(url)) {
+                    if (!autoLoginTemplate.isEmpty()) {
+                        web.evaluateJavascript(onOrigin(url, autoLoginTemplate.replace(
+                                "__PASSWORD__", JSONObject.quote(effectivePassword))), null);
+                    }
+                    if ("/".equals(Uri.parse(url).getPath())) refreshOnlineSources(false);
                 }
                 maybeInjectPreset(url, false);
                 if (prefs.getBoolean(KEY_MOBILE_CSS, true) && web != null) {
                     web.evaluateJavascript(MOBILE_CSS_JS, null);
                 }
+                if (!uiFxJs.isEmpty()) {
+                    web.evaluateJavascript(onOrigin(url, uiFxJs), null);
+                }
                 // 全屏播放增强：重定向原生全屏、放大控件、建立状态上报
-                if (!playerTouchJs.isEmpty() && url.startsWith(currentUrl)) {
-                    web.evaluateJavascript(playerTouchJs, null);
+                if (!playerTouchJs.isEmpty()) {
+                    web.evaluateJavascript(onOrigin(url, playerTouchJs), null);
                     // 不再强制显示网页控制栏：showControls() 会把 art-bottom 钉在画面上，
                     // 也正是「关不掉、点不到进度」的来源。显隐交回 ArtPlayer，全屏态由
                     // setNativeBar(true) 统一压住；这里只同步用户选择的画面模式。
                     callJs("window.__ltv && window.__ltv.setFit('" + fitMode() + "')");
+                    updateCastToggle();
                     // 页面加载会重置 DOM 类名：播放态的「隐藏网页栏 / 沉浸层」必须重放，
                     // 否则网页控制栏与原生细进度线会同时压在底部，两层进度条叠在一起。
                     if (playbackMode) {
@@ -3989,8 +4987,9 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             @Override
             public void onReceivedError(WebView view, int errorCode,
                                         String description, String failingUrl) {
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-                    showError(description, failingUrl);
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                        && (failingUrl == null || sameWebOrigin(failingUrl, currentUrl))) {
+                    showError(description);
                 }
             }
 
@@ -3998,7 +4997,7 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             public void onReceivedError(WebView view, WebResourceRequest request,
                                         WebResourceError error) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && request.isForMainFrame()) {
-                    showError(error.getDescription().toString(), request.getUrl().toString());
+                    showError(error.getDescription().toString());
                 }
             }
         });
@@ -4006,8 +5005,14 @@ public class MainActivity extends Activity implements LocalServer.Callback {
         web.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
-                progress.setProgress(newProgress);
-                progress.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
+                if (newProgress >= 100) {
+                    progress.setProgress(100);
+                    progress.setVisibility(View.GONE);
+                } else {
+                    if (progress.getVisibility() != View.VISIBLE) progress.setVisibility(View.VISIBLE);
+                    android.animation.ObjectAnimator.ofInt(progress, "progress", newProgress)
+                            .setDuration(140).start();
+                }
             }
 
             @Override
@@ -4112,7 +5117,8 @@ public class MainActivity extends Activity implements LocalServer.Callback {
             java.net.URI u = new java.net.URI(s);
             String scheme = u.getScheme();
             String host = u.getHost();
-            if (host == null || host.isEmpty()) return null;
+            if (host == null || host.isEmpty() || u.getUserInfo() != null
+                    || u.getQuery() != null || u.getFragment() != null) return null;
             if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) return null;
             int port = u.getPort();
             if (port < -1 || port > 65535) return null;
@@ -4123,7 +5129,9 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     }
 
     private void load(String url) {
+        bridgeToken = null;
         currentUrl = url;
+        updateBottomNavState(url);
         probeEnvSources(url);
         hideOverlay();
         progress.setVisibility(View.VISIBLE);
@@ -4177,6 +5185,17 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (castPanelOpen) {
+                castPanelOpen = false;
+                stopCastPolling();
+                callJs("window.__ltv && window.__ltv.castHide()");
+                return true;
+            }
+            if (playbackPanelOpen) {
+                playbackPanelOpen = false;
+                callJs("window.__ltv && window.__ltv.closePlaybackOptions()");
+                return true;
+            }
             if (customView != null) {
                 hideCustomView();
                 return true;
@@ -4222,7 +5241,18 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     @Override
     protected void onPause() {
         super.onPause();
-        if (web != null) web.onPause();
+        hasPaused = true;
+        pausedAtMs = System.currentTimeMillis();
+        cancelLongPressRate();
+        cancelPendingSingleTap();
+        if (tempSpeedBoosting) {
+            tempSpeedBoosting = false;
+            callJs("window.__ltv && window.__ltv.setTempRate && window.__ltv.setTempRate(false)");
+        }
+        if (web != null && !inPictureInPicture()) {
+            callJs("window.__ltvWatch && window.__ltvWatch.save && window.__ltvWatch.save()");
+            web.onPause();
+        }
         CookieManager.getInstance().flush();
     }
 
@@ -4230,16 +5260,64 @@ public class MainActivity extends Activity implements LocalServer.Callback {
     protected void onResume() {
         super.onResume();
         if (web != null) web.onResume();
+        syncSystemUi();
+        if (playbackMode && !inPictureInPicture()) {
+            callJs("window.__ltv && window.__ltv.setUiVisible(true)");
+            if (!webControlsMode) {
+                callJs("window.__ltv && window.__ltv.hideWebControls()");
+                callJs("window.__ltv && window.__ltv.setNativeBar(true)");
+            }
+        }
+        if (hasPaused && localMode && LocalServer.abiProblem() == null) {
+            if (serverService == null || !serverService.isActive()) {
+                appLog.w("server", "回到前台时发现本地服务未运行，正在自动恢复");
+                startLocalService();
+            } else if (pausedAtMs > 0 && System.currentTimeMillis() - pausedAtMs > 15000) {
+                final String base = localUrl();
+                new Thread(() -> {
+                    boolean alive = false;
+                    HttpURLConnection c = null;
+                    try {
+                        c = (HttpURLConnection) new URL(base + "/api/status").openConnection(Proxy.NO_PROXY);
+                        c.setConnectTimeout(2000);
+                        c.setReadTimeout(2000);
+                        c.setInstanceFollowRedirects(false);
+                        alive = c.getResponseCode() == 200;
+                    } catch (Exception ignored) {
+                    } finally {
+                        if (c != null) c.disconnect();
+                    }
+                    if (!alive) {
+                        runOnUiThread(() -> {
+                            if (localMode && !isFinishing()) {
+                                appLog.w("server", "后台返回健康探测失败，重启本地服务");
+                                restartLocal();
+                            }
+                        });
+                    }
+                }, "ltv-resume-probe").start();
+            }
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) syncSystemUi();
     }
 
     @Override
     protected void onDestroy() {
-        appLog.i("app", "应用退出，停止本地服务");
+        appLog.i("app", "界面退出");
         cancelControlHide();
         controlHandler.removeCallbacksAndMessages(null);
+        watchdogHandler.removeCallbacksAndMessages(null);
+        if (watchdogThread != null) watchdogThread.interrupt();
+        stopLogRefresh();
+        stopCastPolling();
         if (castDialog != null && castDialog.isShowing()) castDialog.dismiss();
         if (cast != null) cast.shutdown();
-        if (localServer != null) localServer.stop();
+        disconnectLocalService();
         if (filePathCallback != null) {
             filePathCallback.onReceiveValue(null);
             filePathCallback = null;

@@ -5,14 +5,31 @@ set -euo pipefail
 
 TOOLS="${LIBRETV_TOOLS:-/tmp/libretv-apk-tools}"
 SDK="${ANDROID_HOME:-/tmp/androidsdk}"
-JDK_URL="https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/mac/OpenJDK17U-jdk_x64_mac_hotspot_17.0.21_9.tar.gz"
-CT_URL="https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip"
+OS_NAME="$(uname -s)"
+if [ "$OS_NAME" = "Darwin" ]; then
+  JDK_URL="https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/mac/OpenJDK17U-jdk_x64_mac_hotspot_17.0.21_9.tar.gz"
+  CT_URL="https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip"
+else
+  JDK_URL="https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/linux/OpenJDK17U-jdk_x64_linux_hotspot_17.0.21_9.tar.gz"
+  CT_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+fi
 GRADLE_URL="https://mirrors.cloud.tencent.com/gradle/gradle-8.6-bin.zip"
 
 mkdir -p "$TOOLS" "$SDK/cmdline-tools"
 
 # 1) JDK 17
-if ! ls -d "$TOOLS"/jdk-*/Contents/Home/bin/java >/dev/null 2>&1; then
+find_java_home() {
+  local d
+  for d in "$TOOLS"/jdk-*/Contents/Home "$TOOLS"/jdk-*; do
+    if [ -x "$d/bin/java" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! find_java_home >/dev/null 2>&1; then
   if [ ! -s "$TOOLS/jdk17.tar.gz" ]; then
     echo "[1/4] 下载 JDK 17（清华镜像）..."
     curl -fL --retry 3 --max-time 900 -o "$TOOLS/jdk17.tar.gz" "$JDK_URL"
@@ -20,7 +37,7 @@ if ! ls -d "$TOOLS"/jdk-*/Contents/Home/bin/java >/dev/null 2>&1; then
   echo "[1/4] 解压 JDK 17 ..."
   tar -xzf "$TOOLS/jdk17.tar.gz" -C "$TOOLS"
 fi
-export JAVA_HOME="$(ls -d "$TOOLS"/jdk-*/Contents/Home | head -1)"
+export JAVA_HOME="$(find_java_home)"
 export PATH="$JAVA_HOME/bin:$PATH"
 java -version 2>&1 | head -2
 

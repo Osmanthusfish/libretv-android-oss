@@ -101,7 +101,7 @@
   var servers = (process.env.LTV_DNS_SERVERS || '')
     .split(',').map(function (s) { return s.trim(); })
     .filter(function (s) { return /^\d+\.\d+\.\d+\.\d+$/.test(s); });
-  if (!servers.length) servers = ['8.8.8.8', '223.5.5.5'];
+  if (!servers.length) servers = ['223.5.5.5', '119.29.29.29', '8.8.8.8'];
   R.dns.servers = servers;
   try {
     dns.setServers(servers);
@@ -110,10 +110,42 @@
     R.dns.setServersError = shortErr(describe(e));
   }
 
+  var dnsCache = Object.create(null);
+  var dnsInflight = Object.create(null);
+  var DNS_TTL_MS = 60000;
+
   function caresResolve(host) {
-    return dnsP.resolve4(host).then(function (v4) {
-      return (v4 || []).map(function (a) { return { address: a, family: 4 }; });
+    var key = String(host || '').toLowerCase();
+    var hit = dnsCache[key];
+    if (hit && hit.expiresAt > Date.now()) {
+      return Promise.resolve(hit.list);
+    }
+    if (dnsInflight[key]) return dnsInflight[key];
+    var p = dnsP.resolve4(host).then(function (v4) {
+      var list = (v4 || []).map(function (a) { return { address: a, family: 4 }; });
+      if (list.length) return list;
+      return dnsP.resolve6(host).then(function (v6) {
+        return (v6 || []).map(function (a) { return { address: a, family: 6 }; });
+      }, function () { return []; });
+    }, function (err4) {
+      return dnsP.resolve6(host).then(function (v6) {
+        var list = (v6 || []).map(function (a) { return { address: a, family: 6 }; });
+        if (list.length) return list;
+        throw err4;
+      });
+    }).then(function (list) {
+      if (list.length) {
+        if (Object.keys(dnsCache).length > 300) dnsCache = Object.create(null);
+        dnsCache[key] = { list: list, expiresAt: Date.now() + DNS_TTL_MS };
+      }
+      delete dnsInflight[key];
+      return list;
+    }, function (e) {
+      delete dnsInflight[key];
+      throw e;
     });
+    dnsInflight[key] = p;
+    return p;
   }
 
   function noteDns(kind, host, err) {

@@ -11,6 +11,16 @@ debug.keystore
 app/src/main/assets/libretv-settings.json
 app/src/main/assets/sources.json
 app/src/main/assets/default-sources.json
+libretv-点播源-*.json
+libretv-全套-点播+直播.json
+libretv-sources-*.json
+源池.txt
+*.m3u
+*.m3u8
+*.p12
+*.jks
+*.keystore
+_work/
 
 # 构建期下载的第三方运行时（Node ELF + 官方 standalone 包），体积约 100 MB，
 # 由 tools/prepare-node.py 生成，不入库
@@ -25,3 +35,4 @@ tools/.source-health-cache.json
 # Python 缓存
 __pycache__/
 *.pyc
+.oss-bak-*

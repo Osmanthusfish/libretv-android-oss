@@ -453,16 +453,22 @@ public class DlnaCast {
     }
 
     private static String soap(Device d, String action, String inner) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(d.controlUrl).openConnection();
+        URL url = new URL(d.controlUrl);
+        String soapAction = "\"" + AVT + "#" + action + "\"";
+        byte[] b = envelope(action, inner).getBytes("UTF-8");
+        if ("http".equals(url.getProtocol())) {
+            DlnaHttp.Response response = DlnaHttp.request(url, 5000, 8000, soapAction, b);
+            return soapResult(response.status, response.body);
+        }
+        HttpURLConnection c = (HttpURLConnection) url.openConnection();
         try {
             c.setRequestMethod("POST");
             c.setConnectTimeout(5000);
             c.setReadTimeout(8000);
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
-            c.setRequestProperty("SOAPACTION", "\"" + AVT + "#" + action + "\"");
+            c.setRequestProperty("SOAPACTION", soapAction);
             c.setRequestProperty("User-Agent", "LibreTV Android DLNA/1.0");
-            byte[] b = envelope(action, inner).getBytes("UTF-8");
             c.setFixedLengthStreamingMode(b.length);
             OutputStream os = c.getOutputStream();
             os.write(b);
@@ -470,14 +476,18 @@ public class DlnaCast {
             int code = c.getResponseCode();
             InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
             String resp = in == null ? "" : readAll(in);
-            if (code >= 400) throw new IOException("HTTP " + code + " " + brief(resp));
-            if (resp.contains("<Fault>") || resp.contains("UPnPError")) {
-                throw new IOException("设备拒绝：" + brief(resp));
-            }
-            return resp;
+            return soapResult(code, resp);
         } finally {
             c.disconnect();
         }
+    }
+
+    private static String soapResult(int code, String response) throws IOException {
+        if (code < 200 || code >= 300) throw new IOException("HTTP " + code + " " + brief(response));
+        if (response.contains("<Fault>") || response.contains("UPnPError")) {
+            throw new IOException("设备拒绝：" + brief(response));
+        }
+        return response;
     }
 
     private static String brief(String s) {
@@ -500,7 +510,15 @@ public class DlnaCast {
     }
 
     private static String httpGet(String url, int timeout) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        URL target = new URL(url);
+        if ("http".equals(target.getProtocol())) {
+            DlnaHttp.Response response = DlnaHttp.request(target, timeout, timeout, null, null);
+            if (response.status < 200 || response.status >= 300) {
+                throw new IOException("HTTP " + response.status);
+            }
+            return response.body;
+        }
+        HttpURLConnection c = (HttpURLConnection) target.openConnection();
         try {
             c.setConnectTimeout(timeout);
             c.setReadTimeout(timeout);
